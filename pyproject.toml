@@ -1,0 +1,17 @@
+[project]
+name = "bhajan-studio"
+version = "0.1.0"
+description = "Transpose Sai Rhythms bhajans to any key: read the sheet music, synthesize it, or pitch-shift the real recording."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "pymupdf>=1.24",
+    "pillow>=10",
+    "certifi",
+]
+
+[tool.uv]
+package = false
