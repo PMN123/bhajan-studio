@@ -51,6 +51,10 @@ class Source:
     credit: str
     tone: tuple = ()     # (high-shelf dB, shelf Hz, 1st-order low-pass Hz) applied to the mix of notes
     limit_db: float = 0.0  # gentle peak limiting of the mix (hammer attacks), so it is not much quieter than the flute
+    # Repeated note (same key struck again): () = finish the release before the new note (a key-lift gap, as on the
+    # harmonium); (lead s, fade s) = the damper touches the string only `lead` before the hammer strikes again and the
+    # old vibration dies away over `fade`, under the new attack (a piano string is still ringing when it is re-struck)
+    restrike: tuple = ()
 
 
 SOURCES = {
@@ -63,8 +67,12 @@ SOURCES = {
     "piano": Source("FatBoy", "acoustic_grand_piano",
                     "dd9054bbeaff45ab3ce44164ffd08d227fb2ba63dc5530d54644b8a1db7dba3a",
                     sustained=False, release=0.13, gap=0.0, gm_program=0,
-                    credit="FatBoy soundfont (https://fatboy.site), CC BY-SA 3.0", limit_db=6.0),
+                    credit="FatBoy soundfont (https://fatboy.site), CC BY-SA 3.0", limit_db=6.0,
+                    # repeated notes are re-articulated (a ~9 dB dip, like the flute's) instead of chopped by
+                    # ~12 ms of silence (a ~18 dB hole), which made the piano sound choppy on repeated swaras
+                    restrike=(0.015, 0.070)),
 }
+SOUND_VERSION = 2           # bump whenever the rendered piano/harmonium sound changes (part of synth.cache_tag)
 URLS = ("https://gleitz.github.io/midi-js-soundfonts/{sf}/{name}-mp3.js",
         "https://cdn.jsdelivr.net/gh/gleitz/midi-js-soundfonts@gh-pages/{sf}/{name}-mp3.js")
 LO, HI = 21, 108            # MIDI range of the soundfonts (A0..C8); other notes are shifted from the nearest
@@ -435,7 +443,15 @@ def render_notes(instrument: str, notes, spq: float, total: int, offset: int, sr
             continue
         n_on = max(1, int(round(dur_q * spq * sr)) - gap)
         r = rel
-        if nxt[i] is not None:                        # finish the release before the key is struck again
+        if nxt[i] is not None and src.restrike:       # piano: the string is still ringing when it is struck again
+            room = nxt[i] - s0
+            lead, fade = int(src.restrike[0] * sr), max(1, int(src.restrike[1] * sr))
+            if room - n_on <= lead:                    # repeated note: the damper only touches the string briefly
+                n_on = max(1, min(n_on, room - lead))
+                r = fade                               # and the old vibration dies away under the new attack
+            else:                                      # a rest or other notes in between: the usual release,
+                r = max(1, min(rel, room - n_on - lead + fade))  # mostly over before the key is struck again
+        elif nxt[i] is not None:                      # finish the release before the key is struck again
             room = nxt[i] - s0
             r = max(1, min(rel, room - n_on)) if room - n_on >= int(0.02 * sr) else int(0.02 * sr)
             n_on = max(1, min(n_on, room - r))
