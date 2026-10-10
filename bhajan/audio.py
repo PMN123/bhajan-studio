@@ -1,12 +1,19 @@
-"""Recording analysis (which Sa is it sung in?) and high-quality pitch shifting."""
+"""Recording analysis (which Sa is it sung in?) and high-quality pitch shifting.
+
+Everything runs in-process or with the ffmpeg that imageio-ffmpeg bundles, so
+no Homebrew tools are needed: decoding/encoding uses that ffmpeg, and pitch
+shifting uses the Rubber Band library (R3 engine) through pylibrb.
+"""
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 
 import numpy as np
+from scipy import ndimage as ndi
+
+from .media import ffmpeg_exe
 
 PC_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 SARGAM_PC = {"S": 0, "R1": 1, "R2": 2, "G1": 3, "G2": 4, "M1": 5, "M2": 6, "P": 7,
@@ -14,7 +21,7 @@ SARGAM_PC = {"S": 0, "R1": 1, "R2": 2, "G1": 3, "G2": 4, "M1": 5, "M2": 6, "P": 
 
 
 def load_mono(path: str, sr: int = 22050, max_seconds: float | None = 240) -> np.ndarray:
-    cmd = ["ffmpeg", "-v", "error", "-i", path]
+    cmd = [ffmpeg_exe(), "-nostdin", "-v", "error", "-i", path]
     if max_seconds:
         cmd += ["-t", str(max_seconds)]
     cmd += ["-ac", "1", "-ar", str(sr), "-f", "f32le", "-"]
@@ -100,7 +107,8 @@ def track_f0(y: np.ndarray, sr: int, fmin=75.0, fmax=900.0, win=2048, hop=256, t
         tr = np.clip(t + 1, 1, tmax + 1)
         a, bb, c = cmnd[np.arange(len(t)), tl], cmnd[np.arange(len(t)), t], cmnd[np.arange(len(t)), tr]
         den = a - 2 * bb + c
-        shift = np.where(np.abs(den) > 1e-12, 0.5 * (a - c) / den, 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):  # np.where evaluates both branches
+            shift = np.where(np.abs(den) > 1e-12, 0.5 * (a - c) / den, 0.0)
         period = t + np.clip(shift, -1, 1)
         voiced = (val < thresh) & (energy > 1e-5)
         f0 = sr / period
@@ -207,23 +215,182 @@ def semitone_shift(from_pc: int, to_pc: int, octave: int = 0) -> int:
     return d + 12 * octave
 
 
+# ----------------------------------------------------------------- pitch shift
+SHIFT_SR = 44100
+_BLOCK = 65536               # frames per ffmpeg pipe read/write
+_RB_BLOCK = 1024             # frames per Rubber Band call: with large offline blocks the
+                             # output drifts late (~600 samples at 65536); at 1024 it stays
+                             # within ~0.6 ms of the input, like the rubberband CLI
+_CEILING = 10 ** (-1 / 20)   # -1 dBFS sample peak: headroom for MP3 encoding overshoot
+_ENV_HOP = 32                # limiter envelope resolution, frames
+
+
+def _decoded_blocks(src: str, sr: int = SHIFT_SR, channels: int = 2):
+    """Stream-decode with the bundled ffmpeg -> ((channels, n) float32 block, is_last)."""
+    frame = 4 * channels
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen([ffmpeg_exe(), "-nostdin", "-v", "error", "-i", src, "-vn",
+                                 "-ac", str(channels), "-ar", str(sr), "-f", "f32le", "pipe:1"],
+                                stdout=subprocess.PIPE, stderr=err)
+        try:
+            buf = proc.stdout.read(_BLOCK * frame)
+            while buf:
+                nxt = proc.stdout.read(_BLOCK * frame)
+                n = len(buf) // frame
+                blk = np.frombuffer(buf, np.float32, n * channels).reshape(n, channels).T
+                yield np.ascontiguousarray(blk), not nxt
+                buf = nxt
+        finally:
+            proc.stdout.close()
+            rc = proc.wait()
+        if rc:
+            err.seek(0)
+            msg = err.read().decode(errors="replace").strip()[-400:]
+            raise RuntimeError(f"ffmpeg could not decode {os.path.basename(src)}: {msg}")
+
+
+def _release(x: np.ndarray, coef: float) -> np.ndarray:
+    """r[i] = max(x[i], coef * r[i-1]) for x >= 0 (instant attack, exponential release),
+    vectorised as a running maximum in the log domain."""
+    k = np.arange(len(x)) * np.log(coef)
+    with np.errstate(divide="ignore"):
+        lx = np.log(x)
+    return np.exp(np.maximum.accumulate(lx - k) + k)
+
+
+def _clip_guard(y: np.ndarray, ref_rms: float, sr: int = SHIFT_SR, ceiling: float = _CEILING,
+                attack: float = 0.005, release: float = 0.2):
+    """Gain curve keeping shifted audio no louder than the source and under `ceiling`.
+
+    Why it is needed: some Sai Rhythms mp3s are brick-wall-limited masters (peaks
+    pinned at full scale, crest factor ~3.2).  A phase vocoder rebuilds every
+    partial with new phases, which undoes the limiter's peak alignment: the RMS
+    rises only ~3 %, but the crest factor returns to ~4 and peaks reach ~2x full
+    scale all through the track (not isolated clicks).  One overall gain that
+    matched the input peak would cost ~6 dB of loudness (the rubberband CLI turns
+    the whole track down ~2.5 dB and still clips), so instead: (1) scale down
+    only if the output came out louder (RMS) than the source, then (2) a
+    linked-stereo look-ahead peak limiter (5 ms attack, 200 ms release) turns
+    down just the moments that would exceed `ceiling`.  On quieter recordings it
+    does nothing.  y is (frames, channels); returns (frame positions, gains) for
+    np.interp.
+    """
+    n = len(y)
+    hop = _ENV_HOP
+    nb = -(-n // hop)
+    peak = np.zeros(nb, np.float64)
+    sumsq = 0.0
+    step = hop * 8192
+    for s in range(0, n, step):
+        c = y[s:s + step]
+        sumsq += float(np.einsum("ij,ij->", c, c, dtype=np.float64))
+        a = np.abs(c).max(axis=1)
+        a = np.pad(a, (0, -len(a) % hop))
+        peak[s // hop:s // hop + len(a) // hop] = a.reshape(-1, hop).max(axis=1)
+    rms = np.sqrt(sumsq / max(y.size, 1))
+    g0 = min(1.0, ref_rms / rms) if rms > 0 else 1.0
+    with np.errstate(divide="ignore"):
+        need = np.maximum(0.0, 20 * np.log10(peak * g0 / ceiling))   # dB of reduction needed
+    a = int(np.ceil(attack * sr / hop))
+    # spread each requirement over +-(a+1) blocks so that the smoothing below, and the
+    # linear interpolation between neighbouring block gains, never undershoot it
+    red = ndi.maximum_filter1d(need, size=2 * a + 3, mode="constant")
+    red = _release(red, float(np.exp(-hop / (release * sr))))
+    red = ndi.uniform_filter1d(red, size=2 * a + 1, mode="nearest")
+    centers = np.arange(nb) * hop + (hop - 1) / 2
+    return centers, g0 * 10 ** (-red / 20)
+
+
+def _encode_mp3(y: np.ndarray, centers: np.ndarray, gains: np.ndarray, path: str,
+                sr: int = SHIFT_SR) -> None:
+    """Apply the gain curve and encode (frames, 2) float32 audio to MP3 (LAME VBR q2)."""
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen([ffmpeg_exe(), "-v", "error", "-y", "-f", "f32le", "-ar", str(sr),
+                                 "-ac", str(y.shape[1]), "-i", "pipe:0", "-codec:a", "libmp3lame",
+                                 "-q:a", "2", "-f", "mp3", path], stdin=subprocess.PIPE, stderr=err)
+        try:
+            for s in range(0, len(y), _BLOCK * 4):
+                c = y[s:s + _BLOCK * 4]
+                g = np.interp(np.arange(s, s + len(c)), centers, gains).astype(np.float32)
+                proc.stdin.write((c * g[:, None]).tobytes())
+        except BrokenPipeError:
+            pass                                    # ffmpeg died; reported below
+        finally:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            rc = proc.wait()
+        if rc:
+            err.seek(0)
+            raise RuntimeError("ffmpeg could not encode the MP3: "
+                               + err.read().decode(errors="replace").strip()[-400:])
+
+
+def _pieces(blk: np.ndarray, last: bool):
+    """Split a decoded block into _RB_BLOCK pieces -> (piece, is_final_piece)."""
+    n = blk.shape[1]
+    for i in range(0, n, _RB_BLOCK):
+        yield np.ascontiguousarray(blk[:, i:i + _RB_BLOCK]), last and i + _RB_BLOCK >= n
+
+
+def _drain(st, out: np.ndarray, pos: int) -> int:
+    while (avail := st.available()) > 0:
+        r = st.retrieve(avail)                      # (channels, n)
+        n = min(r.shape[1], len(out) - pos)
+        out[pos:pos + n] = r[:, :n].T
+        pos += n
+    return pos
+
+
 def pitch_shift(src: str, dst: str, semitones: float, formant: bool = True) -> str:
-    """Pitch-shift an audio file with Rubber Band's R3 engine (tempo unchanged)."""
-    rb = shutil.which("rubberband") or shutil.which("rubberband-r3")
-    if not rb:
-        raise RuntimeError("rubberband is not installed (brew install rubberband)")
-    with tempfile.TemporaryDirectory() as td:
-        wav_in = os.path.join(td, "in.wav")
-        wav_out = os.path.join(td, "out.wav")
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src, "-ar", "44100", "-ac", "2", wav_in], check=True)
-        if abs(semitones) < 1e-6:
-            shutil.copy(wav_in, wav_out)
+    """Pitch-shift an audio file with Rubber Band's R3 engine (tempo unchanged) -> MP3.
+
+    Rubber Band runs in offline mode (a study pass over the whole file, then the
+    processing pass), fed by two streaming ffmpeg decodes so the input is never
+    held in memory; only the output is (~21 MB per minute) for clip protection.
+    """
+    st = None
+    if abs(semitones) >= 1e-6:
+        import pylibrb                              # loads the native library; only needed here
+        O = pylibrb.Option
+        opts = (O.PROCESS_OFFLINE | O.ENGINE_FINER | O.CHANNELS_TOGETHER
+                | (O.FORMANT_PRESERVED if formant else O.FORMANT_SHIFTED))
+        st = pylibrb.RubberBandStretcher(SHIFT_SR, 2, opts, 1.0, 2.0 ** (semitones / 12.0))
+        st.set_max_process_size(_RB_BLOCK)
+    # pass 1: length and loudness of the source; Rubber Band studies the whole file
+    n_in, sumsq = 0, 0.0
+    for blk, last in _decoded_blocks(src):
+        n_in += blk.shape[1]
+        sumsq += float(np.einsum("ij,ij->", blk, blk, dtype=np.float64))
+        if st is not None:
+            for piece, final in _pieces(blk, last):
+                st.study(piece, final)
+    if n_in == 0:
+        raise RuntimeError(f"no audio could be decoded from {os.path.basename(src)}")
+    # pass 2: shift
+    out = np.empty((n_in, 2), np.float32)
+    pos = 0
+    if st is not None:
+        st.set_expected_input_duration(n_in)
+    for blk, last in _decoded_blocks(src):
+        if st is None:
+            n = min(blk.shape[1], n_in - pos)
+            out[pos:pos + n] = blk[:, :n].T
+            pos += n
         else:
-            cmd = [rb, "-3", "--centre-focus", "-p", f"{semitones:.4f}"]
-            if formant:
-                cmd.append("-F")
-            subprocess.run(cmd + [wav_in, wav_out], check=True, capture_output=True)
-        tmp = dst + ".part.mp3"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", wav_out, "-codec:a", "libmp3lame", "-q:a", "2", tmp], check=True)
+            for piece, final in _pieces(blk, last):
+                st.process(piece, final)
+                pos = _drain(st, out, pos)
+    if st is not None:
+        pos = _drain(st, out, pos)
+    out = out[:pos]
+    centers, gains = _clip_guard(out, np.sqrt(sumsq / (2 * n_in)))
+    tmp = dst + ".part.mp3"
+    try:
+        _encode_mp3(out, centers, gains, tmp)
         os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return dst

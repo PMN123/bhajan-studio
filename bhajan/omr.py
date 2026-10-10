@@ -13,11 +13,14 @@ rendered page at a time:
 """
 from __future__ import annotations
 
-import json
+import logging
 import os
 import re
+import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field, asdict
+from types import SimpleNamespace
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -41,32 +44,127 @@ def sargam_name(midi: int, sa: int = 60) -> str:
 
 
 # --------------------------------------------------------------------------- OCR
-OCR_BIN = os.path.join(os.path.dirname(__file__), "..", "tools", "ocr")
+# Printed sargam labels, lyrics and the tempo mark are read with Apple's Vision
+# framework, called in-process through PyObjC (no compiler or Homebrew needed).
+# BHAJAN_OCR=auto|vision|tesseract|none picks the engine; auto = Vision when it
+# can be imported, else tesseract if it is on PATH, else no OCR (the OMR still
+# works from the notation alone, just without label/lyric/tempo hints).
+OCR_ENGINES = ("auto", "vision", "tesseract", "none")
+_VISION = None          # namespace of PyObjC symbols once resolved; False if unavailable
+_VISION_LOCK = threading.Lock()
+_log = logging.getLogger(__name__)
 
 
-def ensure_ocr_binary() -> str | None:
-    """Compile the Swift Vision OCR helper on first use (macOS only)."""
-    binp = os.path.abspath(OCR_BIN)
-    src = binp + ".swift"
-    if os.path.exists(binp) and os.path.getmtime(binp) >= os.path.getmtime(src):
-        return binp
-    try:
-        subprocess.run(["swiftc", "-O", src, "-o", binp], check=True,
-                       capture_output=True, timeout=300)
-        return binp
-    except Exception:
-        return None
+def _vision_api():
+    """The PyObjC symbols vision_ocr needs, resolved once under a lock: PyObjC's lazy
+    framework modules are not safe to populate from several threads at once (a
+    concurrent first lookup raised KeyError inside uvicorn's thread pool)."""
+    global _VISION
+    with _VISION_LOCK:
+        if _VISION is None:
+            try:
+                import objc
+                import Quartz
+                import Vision
+                _VISION = SimpleNamespace(
+                    autorelease_pool=objc.autorelease_pool,
+                    url_for_path=Quartz.CFURLCreateFromFileSystemRepresentation,
+                    image_source=Quartz.CGImageSourceCreateWithURL,
+                    image_at=Quartz.CGImageSourceCreateImageAtIndex,
+                    image_w=Quartz.CGImageGetWidth, image_h=Quartz.CGImageGetHeight,
+                    min_x=Quartz.CGRectGetMinX, max_y=Quartz.CGRectGetMaxY,
+                    rect_w=Quartz.CGRectGetWidth, rect_h=Quartz.CGRectGetHeight,
+                    TextRequest=Vision.VNRecognizeTextRequest,
+                    Handler=Vision.VNImageRequestHandler,
+                    accurate=Vision.VNRequestTextRecognitionLevelAccurate)
+            except Exception:
+                _VISION = False
+    return _VISION or None
 
 
-def run_ocr(png_path: str) -> list[dict]:
-    binp = ensure_ocr_binary()
-    if binp:
+def _ocr_choice(engine: str | None) -> str:
+    eng = (engine or os.environ.get("BHAJAN_OCR") or "auto").strip().lower()
+    if eng not in OCR_ENGINES:
+        raise ValueError(f"OCR engine must be one of {'/'.join(OCR_ENGINES)}, not {eng!r}")
+    return eng
+
+
+def ocr_engine(engine: str | None = None) -> str:
+    """The engine run_ocr will use: 'vision', 'tesseract' or 'none'."""
+    eng = _ocr_choice(engine)
+    if eng != "auto":
+        return eng
+    if _vision_api():
+        return "vision"
+    return "tesseract" if shutil.which("tesseract") else "none"
+
+
+def run_ocr(png_path: str, engine: str | None = None) -> list[dict]:
+    """OCR an image -> tokens {t, x, y, w, h, c[, line]}: pixel box (top-left origin),
+    confidence 0..1, and for Vision the whole recognised line the token came from."""
+    choice = _ocr_choice(engine)
+    eng = ocr_engine(choice)
+    if eng == "vision":
         try:
-            r = subprocess.run([binp, png_path], capture_output=True, timeout=120, check=True)
-            return json.loads(r.stdout or b"[]")
-        except Exception:
-            pass
-    return tesseract_ocr(png_path)
+            return vision_ocr(png_path)
+        except Exception as e:
+            if choice != "auto":
+                raise
+            _log.warning("Vision OCR failed on %s (%s); trying tesseract", png_path, e)
+            return tesseract_ocr(png_path)
+    if eng == "tesseract":
+        if choice != "auto" and not shutil.which("tesseract"):
+            raise RuntimeError("BHAJAN_OCR=tesseract but tesseract is not on PATH")
+        return tesseract_ocr(png_path)
+    return []
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def vision_ocr(png_path: str) -> list[dict]:
+    """Apple Vision text recognition (accurate, no language correction), one token per
+    whitespace-separated word with its own box.  Thread-safe; macOS only."""
+    v = _vision_api()
+    if not v:
+        raise RuntimeError("Vision OCR needs macOS and pyobjc-framework-Vision/-Quartz")
+    out = []
+    with v.autorelease_pool():
+        path = os.fsencode(os.path.abspath(png_path))
+        src = v.image_source(v.url_for_path(None, path, len(path), False), None)
+        img = v.image_at(src, 0, None) if src is not None else None
+        if img is None:
+            raise RuntimeError(f"cannot read image {png_path}")
+        W, H = float(v.image_w(img)), float(v.image_h(img))
+        req = v.TextRequest.alloc().init()
+        req.setRecognitionLevel_(v.accurate)
+        req.setUsesLanguageCorrection_(False)
+        req.setMinimumTextHeight_(0.004)
+        handler = v.Handler.alloc().initWithCGImage_options_(img, {})
+        ok, err = handler.performRequests_error_([req], None)
+        if not ok:
+            raise RuntimeError(f"Vision OCR failed: {err}")
+        for obs in req.results() or []:
+            cands = obs.topCandidates_(1)
+            if not cands:
+                continue
+            cand = cands[0]
+            line = str(cand.string())
+            conf = float(cand.confidence())
+            for m in re.finditer(r"\S+", line):
+                rng = (_utf16_len(line[:m.start()]), _utf16_len(m.group()))
+                box, _ = cand.boundingBoxForRange_error_(rng, None)
+                if box is None:
+                    continue
+                bb = box.boundingBox()          # normalised, bottom-left origin
+                out.append({"t": m.group(),
+                            "x": v.min_x(bb) * W,
+                            "y": (1 - v.max_y(bb)) * H,
+                            "w": v.rect_w(bb) * W,
+                            "h": v.rect_h(bb) * H,
+                            "c": conf, "line": line})
+    return out
 
 
 def tesseract_ocr(png_path: str) -> list[dict]:

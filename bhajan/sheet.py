@@ -2,18 +2,24 @@
 from __future__ import annotations
 
 import collections
-import json
+import logging
 import os
 import re
+import threading
+import time
 
 import pymupdf as fitz
 import numpy as np
 from PIL import Image
 
-from . import omr
+from . import omr, store
 
 DPI = 250
-SCHEMA = 4  # bump to invalidate cached scores when the reader changes
+SCHEMA = 5  # bump to invalidate cached scores when the reader changes
+DEGRADED_RETRY = 600  # seconds before a sheet whose OCR failed is read again
+_log = logging.getLogger(__name__)
+_degraded: dict[str, tuple[float, dict]] = {}   # work_dir -> (time, score) for reads that are not cached on disk
+_degraded_lock = threading.Lock()
 
 
 def render_pages(pdf_path: str, out_dir: str) -> list[str]:
@@ -23,12 +29,33 @@ def render_pages(pdf_path: str, out_dir: str) -> list[str]:
         p = os.path.join(out_dir, f"page{i}.png")
         if not os.path.exists(p):
             pix = page.get_pixmap(dpi=DPI, colorspace=fitz.csRGB, alpha=False)
-            pix.save(p)
+            store.write_bytes(p, pix.tobytes("png"))
         paths.append(p)
     return paths
 
 
-def _tempo_retry(png: str, rgb: np.ndarray) -> int | None:
+def _load_page(pdf_path: str, work_dir: str, png: str) -> np.ndarray:
+    try:
+        return np.asarray(Image.open(png).convert("RGB"))
+    except OSError:  # damaged by an older version or a crash: render it again
+        os.remove(png)
+        render_pages(pdf_path, work_dir)
+        return np.asarray(Image.open(png).convert("RGB"))
+
+
+def _ocr(png: str, engine: str) -> tuple[list[dict], bool]:
+    """(tokens, ok). ok is False when the OCR engine failed, as opposed to finding no text."""
+    if engine == "none":
+        return [], True
+    try:
+        return omr.run_ocr(png, engine=engine), True
+    except Exception as e:
+        _log.warning("OCR (%s) failed on %s (%s); reading the notes without the printed labels",
+                     engine, png, e)
+        return [], False
+
+
+def _tempo_retry(png: str, rgb: np.ndarray, engine: str) -> int | None:
     """Re-OCR an enlarged crop around the red tempo mark."""
     _, _, red = omr.masks(rgb)
     if not red.any():
@@ -39,7 +66,7 @@ def _tempo_retry(png: str, rgb: np.ndarray) -> int | None:
     crop = Image.fromarray(rgb[y0:y1, x0:x1]).resize(((x1 - x0) * 3, (y1 - y0) * 3), Image.LANCZOS)
     tmp = png[:-4] + "_tempo.png"
     crop.save(tmp)
-    for o in omr.run_ocr(tmp):
+    for o in _ocr(tmp, engine)[0]:
         m = re.search(r"(\d{2,3})", o["t"])
         if m and 40 <= int(m.group(1)) <= 240:
             return int(m.group(1))
@@ -47,29 +74,41 @@ def _tempo_retry(png: str, rgb: np.ndarray) -> int | None:
 
 
 def read_sheet(pdf_path: str, work_dir: str) -> dict:
+    """Read a sheet PDF into a score, cached in work_dir/score.json.
+
+    The cache is reused while SCHEMA and the available OCR engine are unchanged. A read in which the
+    OCR engine failed is not written to disk (it lacks labels, lyrics and tempo); it is kept in memory
+    and retried after DEGRADED_RETRY seconds, so a fixed or newly installed OCR engine gets used.
+    """
     os.makedirs(work_dir, exist_ok=True)
     cache = os.path.join(work_dir, "score.json")
-    if os.path.exists(cache):
-        with open(cache) as f:
-            score = json.load(f)
-        if score.get("schema") == SCHEMA:
-            return score
+    engine = omr.ocr_engine()
+    score = store.read_json(cache)
+    if score is not None and score.get("schema") == SCHEMA and score.get("ocr") == engine:
+        return score
+    with _degraded_lock:
+        hit = _degraded.get(work_dir)
+    if hit and hit[1].get("ocr") == engine and time.time() - hit[0] < DEGRADED_RETRY:
+        return hit[1]
 
     pages = render_pages(pdf_path, work_dir)
     all_events, page_info, warnings = [], [], []
     tempo = None
     measure_base = 0
     staff_base = 0
+    ocr_ok = True
     for pi, png in enumerate(pages):
-        rgb = np.asarray(Image.open(png).convert("RGB"))
-        res = omr.read_page(rgb, pi, omr.run_ocr(png))
+        rgb = _load_page(pdf_path, work_dir, png)
+        tokens, ok = _ocr(png, engine)
+        ocr_ok &= ok
+        res = omr.read_page(rgb, pi, tokens)
         page_info.append({"w": rgb.shape[1], "h": rgb.shape[0], "staves": len(res["staves"])})
         if not res["staves"]:
             continue
         if pi == 0:
             tempo = res["tempo"]
             if tempo is None or not (40 <= tempo <= 240):
-                tempo = _tempo_retry(png, rgb)
+                tempo = _tempo_retry(png, rgb, engine)
         warnings += res["warnings"]
         for si, st in enumerate(res["staves"]):
             evs = [e for e in res["events"] if e.staff == si]
@@ -109,6 +148,8 @@ def read_sheet(pdf_path: str, work_dir: str) -> dict:
     agree = sum(1 for e in labelled if omr.sargam_label_to_midi(e["label"]) == e["midi"])
     score = {
         "schema": SCHEMA,
+        "ocr": engine,
+        "ocr_ok": ocr_ok,
         "tempo": tempo,
         "bar": bar,
         "pages": page_info,
@@ -122,6 +163,11 @@ def read_sheet(pdf_path: str, work_dir: str) -> dict:
             "label_agreement": (agree / len(labelled)) if labelled else None,
         },
     }
-    with open(cache, "w") as f:
-        json.dump(score, f)
+    if ocr_ok:
+        store.write_json(cache, score)
+        with _degraded_lock:
+            _degraded.pop(work_dir, None)
+    else:
+        with _degraded_lock:
+            _degraded[work_dir] = (time.time(), score)
     return score

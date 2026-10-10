@@ -1,14 +1,20 @@
-"""Render a bhajan melody as audio: harmonium or flute over a tanpura drone.
+"""Render a bhajan melody as audio: flute, piano or harmonium, optionally over a tanpura drone.
 
-Wavetable synthesis keeps it fast (a few seconds for a whole song) and band-limited.
+The flute and the tanpura are wavetable synthesis (fast and band-limited). Piano and harmonium play real
+recorded samples (see instruments.py); if those cannot be downloaded the synthesized versions are used instead.
 """
 from __future__ import annotations
 
+import os
 import struct
 import wave
 
 import numpy as np
 
+from . import instruments
+
+INSTRUMENTS = ("flute", "piano", "harmonium")
+GM_PROGRAMS = {"flute": 73, "piano": 0, "harmonium": 20}  # General MIDI (0-based): flute, grand piano, reed organ
 TABLE = 4096
 _rng = np.random.default_rng(7)
 _PHASES = _rng.uniform(0, 2 * np.pi, 64)
@@ -44,6 +50,14 @@ def _harmonium_amps(f: float, sr: int) -> np.ndarray:
     hz = k * f
     amps = k ** -0.75 * (1 + 1.6 * np.exp(-((hz - 1300) / 800) ** 2)) * np.where(k % 2 == 0, 0.8, 1.0)
     amps *= np.clip((0.45 * sr - hz) / (0.1 * sr), 0, 1)  # roll off near Nyquist
+    return amps
+
+
+def _piano_amps(f: float, sr: int, bright: float) -> np.ndarray:
+    n = max(1, min(40, int(0.45 * sr / f)))
+    k = np.arange(1, n + 1)
+    amps = k ** -1.1 * np.exp(-k * f / (1200 + 3500 * bright)) * np.where(k % 7 == 0, 0.3, 1.0)
+    amps *= np.clip((0.45 * sr - k * f) / (0.1 * sr), 0, 1)
     return amps
 
 
@@ -99,8 +113,8 @@ def _envelope(n_on: int, n_rel: int, sr: int, attack: float, release: float) -> 
 
 def _render_melody(notes, spq: float, total: int, offset: int, sr: int, instrument: str) -> np.ndarray:
     out = np.zeros(total, np.float32)
-    release = 0.09 if instrument == "harmonium" else 0.12
-    attack = 0.03 if instrument == "harmonium" else 0.06
+    release = {"harmonium": 0.09, "piano": 0.13}.get(instrument, 0.12)
+    attack = {"harmonium": 0.03, "piano": 0.004}.get(instrument, 0.06)
     n_rel = int(release * sr)
     cache = {}
     for start_q, dur_q, m in notes:
@@ -123,6 +137,15 @@ def _render_melody(notes, spq: float, total: int, offset: int, sr: int, instrume
             noise = _rng.standard_normal(n).astype(np.float32)
             noise = np.convolve(noise, np.ones(6, np.float32) / 6, mode="same")
             sig = sig + 0.06 * noise * (0.4 + 0.6 * np.exp(-tt / 0.15))
+        elif instrument == "piano":  # offline fallback for the sampled piano
+            key = ("pn", m)
+            if key not in cache:
+                cache[key] = (_table(_piano_amps(f, sr, 1.0)), _table(_piano_amps(f, sr, 0.0)))
+            bright, mellow = cache[key]
+            tt = np.arange(n, dtype=np.float32) / sr
+            tau = 1.6 * (261.6 / f) ** 0.6  # lower strings ring longer
+            sig = (0.55 * _osc(bright, f, n, sr) * np.exp(-tt / (0.25 * tau))
+                   + _osc(mellow, f * 1.0004, n, sr) * np.exp(-tt / tau))
         else:
             key = ("hm", m)
             if key not in cache:
@@ -172,19 +195,44 @@ def _render_drone(sa_midi: int, kind: str, total: int, sr: int) -> np.ndarray:
     return out / (np.abs(out).max() + 1e-9)
 
 
-def _render_click(total: int, sr: int, lead: int, spq: float, length_q: float, bar_q: float) -> np.ndarray:
+def _click_grid(events, spans, length_q: float, bar_q: float) -> list[tuple[float, bool]]:
+    """Metronome positions [(quarter, accented)]: every beat (every eighth in 5/8, 7/8, ...), with the
+    accent on each bar's real first note, so pickup bars and meter changes stay in step."""
+    odd_eighths = bar_q > 0 and abs(bar_q * 2 - round(bar_q * 2)) < 1e-6 and round(bar_q * 2) % 2 == 1
+    step = 0.5 if odd_eighths else 1.0
+    bars: list[list[float]] = []
+    last = None
+    for e, (a, b) in zip(events, spans):
+        m = e.get("measure")
+        if m is None:  # no bar information: a steady grid from the start
+            n = int(length_q / step + 1e-6)
+            return [(k * step, bar_q > 0 and abs(k * step / bar_q - round(k * step / bar_q)) < 1e-6)
+                    for k in range(n + 1)]
+        if not bars or m != last:
+            bars.append([a, b])
+            last = m
+        else:
+            bars[-1][1] = b
+    out = []
+    for i, (a, b) in enumerate(bars):
+        pickup = i == 0 and b - a < bar_q - 1e-6
+        k = 0
+        while a + k * step < b - 1e-6:
+            out.append((a + k * step, k == 0 and not pickup))
+            k += 1
+    return out
+
+
+def _render_click(total: int, sr: int, lead: int, spq: float, grid) -> np.ndarray:
     out = np.zeros(total, np.float32)
     n = int(0.03 * sr)
     tt = np.arange(n, dtype=np.float32) / sr
     hi = np.sin(2 * np.pi * 1800 * tt) * np.exp(-tt / 0.006)
     lo = np.sin(2 * np.pi * 1100 * tt) * np.exp(-tt / 0.005) * 0.6
-    q = 0.0
-    while q < length_q + 1e-6:
+    for q, accent in grid:
         s0 = lead + int(round(q * spq * sr))
-        accent = bar_q > 0 and abs((q / bar_q) - round(q / bar_q)) < 1e-6
         if s0 + n < total:
             out[s0:s0 + n] += hi if accent else lo
-        q += 1.0
     return out
 
 
@@ -200,21 +248,45 @@ def _reverb(x: np.ndarray, sr: int, wet=0.16, seconds=1.1) -> np.ndarray:
     return (1 - wet) * x + wet * y * 0.6
 
 
-def render(events, sa_midi, tempo_bpm, sr=32000, instrument="harmonium", drone=False, drone_kind="pa",
+def _melody(notes, spq: float, total: int, lead: int, sr: int, instrument: str) -> np.ndarray:
+    if instrument == "flute":
+        return _render_melody(notes, spq, total, lead, sr, "flute")
+    inst = instrument if instrument in instruments.SOURCES else "harmonium"
+    try:
+        return instruments.render_notes(inst, notes, spq, total, lead, sr)
+    except Exception as e:  # offline or broken download: never fail the render
+        instruments.warn(f"{inst} samples unavailable ({type(e).__name__}: {e}); using the synthesized {inst}")
+        return _render_melody(notes, spq, total, lead, sr, inst)
+
+
+def cache_tag(instrument: str) -> str:
+    """Changes whenever the sound of `instrument` would change; meant for render cache keys."""
+    parts = [str(instrument), str(os.path.getmtime(__file__))]
+    if instrument != "flute":
+        inst = instrument if instrument in instruments.SOURCES else "harmonium"
+        parts += [str(os.path.getmtime(instruments.__file__)), "sampled" if instruments.is_cached(inst) else "synth"]
+    return "|".join(parts)
+
+
+def render(events, sa_midi, tempo_bpm, sr=32000, instrument="flute", drone=False, drone_kind="pa",
            drone_level=0.2, click=False, beats_per_bar=4, lead_in=2.0, tail=2.0):
-    """Render events to mono float32 audio. Returns (audio, [(start_sec, end_sec) per event])."""
+    """Render events to mono float32 audio. Returns (audio, [(start_sec, end_sec) per event]).
+
+    instrument: "flute" (synthesized), "piano" or "harmonium" (recorded samples, synthesized if offline).
+    """
     events = [dict(e, midi=None if e.get("midi") is None else e["midi"] - 60 + sa_midi) for e in events]
     spq = 60.0 / float(tempo_bpm)
     notes, spans, length_q = _merge(events)
     lead = int(lead_in * sr)
     total = lead + int((length_q * spq + tail) * sr)
-    mel = _render_melody(notes, spq, total, lead, sr, "flute" if instrument == "flute" else "harmonium")
+    mel = _melody(notes, spq, total, lead, sr, instrument)
     mel /= np.abs(mel).max() + 1e-9
     mix = mel.copy()
     if drone:
         mix += drone_level * _render_drone(sa_midi, drone_kind, total, sr)
     if click:
-        mix += 0.25 * _render_click(total, sr, lead, spq, length_q, float(beats_per_bar))
+        grid = _click_grid(events, spans, length_q, float(beats_per_bar))
+        mix += 0.25 * _render_click(total, sr, lead, spq, grid)
     mix = _reverb(mix, sr)
     fade = int(0.02 * sr)
     mix[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
@@ -243,8 +315,14 @@ def _vlq(n: int) -> bytes:
     return bytes(reversed(out))
 
 
-def write_midi(path, events, sa_midi, tempo_bpm, program=20):
-    """Standard MIDI file (format 0) of the melody in the chosen key, with lyrics."""
+def write_midi(path, events, sa_midi, tempo_bpm, program=None, instrument=None):
+    """Standard MIDI file (format 0) of the melody in the chosen key, with lyrics.
+
+    program: General MIDI program (0-based); by default the instrument's (flute 73, piano 0,
+    harmonium -> reed organ 20), or 20 when no instrument is given.
+    """
+    if program is None:
+        program = GM_PROGRAMS.get(instrument, 20)
     tpq = 480
     shifted = [dict(e, midi=None if e.get("midi") is None else e["midi"] - 60 + sa_midi) for e in events]
     notes, spans, _ = _merge(shifted)
