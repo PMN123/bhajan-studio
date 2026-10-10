@@ -147,13 +147,14 @@ def _tanpura_cycle(sa_midi: int, kind: str, sr: int, cycle: float, tail: float) 
         f = _freq(m) * det
         nh = max(1, min(30, int(0.4 * sr / f)))
         k = np.arange(1, nh + 1)
-        bright = _table(k ** -0.75 * (1 + 0.6 * (k % 2 == 0)) * np.exp(-k * f / 4500))
+        bright = _table(k ** -0.9 * np.exp(-k * f / 2500))
         mellow = _table(k ** -1.3)
         ln = int(tail * sr)
         tt = np.arange(ln, dtype=np.float32) / sr
         decay = np.exp(-6.9 * tt / 4.8)
         jawari = np.clip(tt / 0.35, 0, 1) * np.exp(-tt / 1.6)  # buzz swells then fades
-        sig = _osc(bright, f, ln, sr) * (0.25 + 0.75 * jawari) + _osc(mellow, f, ln, sr) * 0.9
+        # keep the buzz subtle: strong swelling overtones sound like extra notes
+        sig = _osc(bright, f, ln, sr) * (0.12 + 0.3 * jawari) + _osc(mellow, f, ln, sr)
         pluck = np.minimum(1, tt / 0.015) ** 2
         s0 = int(off * sr)
         out[s0:s0 + ln] += (sig * decay * pluck)[: n - s0] * (0.8 if m == sa_midi - 12 else 1.0)
@@ -199,8 +200,8 @@ def _reverb(x: np.ndarray, sr: int, wet=0.16, seconds=1.1) -> np.ndarray:
     return (1 - wet) * x + wet * y * 0.6
 
 
-def render(events, sa_midi, tempo_bpm, sr=32000, instrument="harmonium", drone=True, drone_kind="pa",
-           drone_level=0.35, click=False, beats_per_bar=4, lead_in=2.0, tail=2.0):
+def render(events, sa_midi, tempo_bpm, sr=32000, instrument="harmonium", drone=False, drone_kind="pa",
+           drone_level=0.2, click=False, beats_per_bar=4, lead_in=2.0, tail=2.0):
     """Render events to mono float32 audio. Returns (audio, [(start_sec, end_sec) per event])."""
     events = [dict(e, midi=None if e.get("midi") is None else e["midi"] - 60 + sa_midi) for e in events]
     spq = 60.0 / float(tempo_bpm)

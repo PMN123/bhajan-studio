@@ -6,7 +6,7 @@ Pick any bhajan from [Sai Rhythms](https://sairhythms.org), choose your Sa (key)
    preservation, so the singer still sounds like themselves. The app first works out which key the
    recording is actually sung in, which is often not the published reference pitch.
 2. **The Sai Samarpan sheet music, read note by note, transposed and played back** on a
-   synthesized harmonium or flute with a tanpura drone. You can view it as sargam, as transposed
+   synthesized harmonium or flute (instrument only by default; a soft tanpura drone is optional). You can view it as sargam, as transposed
    staff notation, or as the original sheet with every detected note outlined. WAV and MIDI
    downloads are included.
 
