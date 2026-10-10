@@ -16,7 +16,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const state = {
   song: null, slug: null, pc: 0, octave: 0,
   analysis: null, recSa: null, audioI: 0, dirAlt: false, snap: true, formant: true, shifted: {},
-  score: null, sheetI: 0, view: "sargam", tempo: 90, instrument: "harmonium", drone: false, droneKind: "pa", click: false,
+  score: null, sheetI: 0, view: "sargam", tempo: 90, instrument: "flute", drone: false, droneKind: "pa", click: false,
   timings: null, cur: -1, gridEls: [], staffEls: [], boxEls: [], raf: 0,
 };
 
@@ -297,7 +297,7 @@ function renderScore() {
     <div class="row">
       ${sheetSel}
       <label class="field">Tempo <input type="range" id="tempo" min="40" max="220" step="1" value="${Math.round(state.tempo)}"><span class="v" id="tempov">${Math.round(state.tempo)}</span> bpm</label>
-      <label class="field">Instrument <select id="instr"><option value="harmonium">Harmonium</option><option value="flute">Flute</option></select></label>
+      <label class="field">Instrument <select id="instr"><option value="flute">Flute</option><option value="harmonium">Harmonium</option></select></label>
       <label class="field">Octave <select id="oct"><option value="-1">Lower</option><option value="0" selected>Middle</option><option value="1">Higher</option></select></label>
       <label class="field" title="A soft Sa-Pa drone underneath, like a tanpura or shruti box"><input type="checkbox" id="drone" ${state.drone ? "checked" : ""}> Add tanpura drone
         <select id="dronek"><option value="pa">Sa-Pa</option><option value="ma">Sa-Ma</option></select></label>

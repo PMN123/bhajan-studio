@@ -99,7 +99,7 @@ class RenderReq(BaseModel):
     sheet_i: int = 0
     sa_midi: int = 60
     tempo: float = 90
-    instrument: str = "harmonium"
+    instrument: str = "flute"
     drone: bool = False
     drone_kind: str = "pa"
     click: bool = False
