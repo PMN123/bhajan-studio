@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bhajan Studio launcher for macOS.
+# Bhajan Studio launcher for macOS and Linux.
 #
 #   ./start.sh                 start the app and open it in your browser
 #   ./start.sh --port 9000     use another port (the next free one is used if it is busy)
@@ -49,38 +49,66 @@ if [ -n "$PORT_ARG" ]; then
   [ "$PORT_ARG" -ge 1 ] && [ "$PORT_ARG" -le 65535 ] || die "--port must be between 1 and 65535"
 fi
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  say "Note: Bhajan Studio is made for macOS; trying anyway."
-else
-  # The packages uv installs have no builds for older systems (it would try to compile SciPy and fail).
-  macos_version="$(sw_vers -productVersion 2>/dev/null || true)"
-  macos_major="$(printf '%s' "$macos_version" | cut -d. -f1)"
-  macos_minor="$(printf '%s' "$macos_version" | cut -d. -f2)"
-  case "$macos_major$macos_minor" in *[!0-9]*|"") macos_major=99; macos_minor=0 ;; esac
-  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
-    if [ "$macos_major" -lt 12 ]; then
-      die "Bhajan Studio needs macOS 12 (Monterey) or later on Apple Silicon Macs; this Mac has macOS $macos_version. Update it in System Settings > Software Update, then try again."
+OS_NAME="$(uname -s)"
+case "$OS_NAME" in
+  Darwin)
+    # The packages uv installs have no builds for older systems (it would try to compile SciPy and fail).
+    macos_version="$(sw_vers -productVersion 2>/dev/null || true)"
+    macos_major="$(printf '%s' "$macos_version" | cut -d. -f1)"
+    macos_minor="$(printf '%s' "$macos_version" | cut -d. -f2)"
+    case "$macos_major$macos_minor" in *[!0-9]*|"") macos_major=99; macos_minor=0 ;; esac
+    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
+      if [ "$macos_major" -lt 12 ]; then
+        die "Bhajan Studio needs macOS 12 (Monterey) or later on Apple Silicon Macs; this Mac has macOS $macos_version. Update it in System Settings > Software Update, then try again."
+      fi
+    elif [ "$macos_major" -eq 10 ] && [ "$macos_minor" -lt 15 ]; then
+      die "Bhajan Studio needs macOS 10.15 (Catalina) or later; this Mac has macOS $macos_version."
     fi
-  elif [ "$macos_major" -eq 10 ] && [ "$macos_minor" -lt 15 ]; then
-    die "Bhajan Studio needs macOS 10.15 (Catalina) or later; this Mac has macOS $macos_version."
-  fi
-  # Files from a downloaded ZIP carry Apple's quarantine flag; clear it so macOS stops asking.
-  if xattr -p com.apple.quarantine . >/dev/null 2>&1 \
-      || xattr -p com.apple.quarantine start.sh >/dev/null 2>&1 \
-      || xattr -p com.apple.quarantine start.command >/dev/null 2>&1; then
-    xattr -dr com.apple.quarantine . 2>/dev/null || true
-  fi
-fi
+    # Files from a downloaded ZIP carry Apple's quarantine flag; clear it so macOS stops asking.
+    if xattr -p com.apple.quarantine . >/dev/null 2>&1 \
+        || xattr -p com.apple.quarantine start.sh >/dev/null 2>&1 \
+        || xattr -p com.apple.quarantine start.command >/dev/null 2>&1; then
+      xattr -dr com.apple.quarantine . 2>/dev/null || true
+    fi
+    ;;
+  Linux)
+    # Nothing macOS-specific to do here; Linux runs the same uv + Python 3.12 setup.
+    ;;
+  *)
+    die "This launcher is for macOS and Linux (found: $OS_NAME). On Windows, double-click start.bat or run start.ps1 in PowerShell."
+    ;;
+esac
 
 uv_instructions() {
   say ""
   say "Bhajan Studio needs uv, a small free tool that runs Python apps without touching the rest"
-  say "of your Mac. To install it, open Terminal and run:"
+  say "of your computer. To install it, open a terminal and run:"
   say ""
   say "    $UV_INSTALL_CMD"
   say ""
-  say "then run ./start.sh again (or double-click start.command)."
+  if [ "$OS_NAME" = "Darwin" ]; then
+    say "then run ./start.sh again (or double-click start.command)."
+  else
+    say "then run ./start.sh again."
+  fi
   say "More about uv: https://docs.astral.sh/uv/getting-started/installation/"
+}
+
+first_run_message() {
+  if [ "$OS_NAME" = "Darwin" ]; then
+    say "First run: uv will now download Python 3.12 and the app's packages, including ffmpeg,"
+    say "the Rubber Band pitch shifter and the macOS Vision bindings (about 110 MB to download,"
+    say "about 400 MB on disk). This happens once: under a minute on a fast connection, a few"
+    say "minutes on a slow one. Later starts take a few seconds."
+  else
+    say "First run: uv will now download Python 3.12 and the app's packages, including ffmpeg"
+    say "and the Rubber Band pitch shifter (about 100 MB to download, about 350 MB on disk)."
+    say "This happens once: under a minute on a fast connection, a few minutes on a slow one."
+    say "Later starts take a few seconds."
+    say ""
+    say "Reading lyrics from sheet music (OCR) uses tesseract if it is installed (for example:"
+    say "sudo apt install tesseract-ocr); everything else works without it."
+  fi
 }
 
 UV="$(command -v uv 2>/dev/null || true)"
@@ -119,7 +147,7 @@ if [ -z "$UV" ]; then
   case "$answer" in
     ""|[Yy]|[Yy][Ee][Ss]) ;;
     *)
-      say "OK, not installing. To install uv later, run the command above in Terminal, then"
+      say "OK, not installing. To install uv later, run the command above in a terminal, then"
       say "start Bhajan Studio again."
       exit 1 ;;
   esac
@@ -132,15 +160,12 @@ if [ -z "$UV" ]; then
   PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
   export PATH
   UV="$(command -v uv 2>/dev/null || true)"
-  [ -n "$UV" ] || { say "uv was installed but can't be found; open a new Terminal window and try again."; exit 1; }
+  [ -n "$UV" ] || { say "uv was installed but can't be found; open a new terminal window and try again."; exit 1; }
   say ""
 fi
 
 if [ ! -x .venv/bin/python ]; then
-  say "First run: uv will now download Python 3.12 and the app's packages, including ffmpeg,"
-  say "the Rubber Band pitch shifter and the macOS Vision bindings (about 110 MB to download,"
-  say "about 400 MB on disk). This happens once: under a minute on a fast connection, a few"
-  say "minutes on a slow one. Later starts take a few seconds."
+  first_run_message
   say ""
 fi
 
