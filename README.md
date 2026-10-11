@@ -6,14 +6,25 @@ sung in and pitch-shifts it to yours, keeping the singer's voice natural. It als
 Sai Samarpan sheet music note by note, transposes it, and plays it back on a flute (or a sampled
 piano or harmonium), with an optional soft tanpura drone. You can follow along in sargam, in
 transposed staff notation, or on the original sheet with every note outlined, and download WAV
-or MIDI. It all runs on your own Mac.
+or MIDI. It runs on your own computer (a Mac, Windows or Linux), or on a server that your whole
+centre can use.
 
 ## Quick start
 
-You need a Mac with macOS 12 (Monterey) or later on Apple Silicon, or macOS 10.15 (Catalina) or
-later on Intel, and an internet connection the first time. You don't need Homebrew, Xcode or your
-own Python. (Tested on Apple Silicon. The bundled packages include Intel builds, but no one has
-tried an Intel Mac yet; if you do, please open an issue either way.)
+You need an internet connection the first time. You don't need your own Python: the launcher sets
+everything up inside the folder.
+
+- [macOS](#macos)
+- [Windows](#windows)
+- [Linux](#linux)
+- [Install it as an app](#install-it-as-an-app) (a window and an icon of its own)
+- [Run it on a server (Docker)](#run-it-on-a-server-docker)
+
+### macOS
+
+You need macOS 12 (Monterey) or later on Apple Silicon, or macOS 10.15 (Catalina) or later on
+Intel. You don't need Homebrew or Xcode. (Tested on Apple Silicon. The bundled packages include
+Intel builds, but no one has tried an Intel Mac yet; if you do, please open an issue either way.)
 
 Keep the folder somewhere ordinary, such as your home folder (Finder → Go → Home), not inside an
 iCloud-synced Desktop or Documents folder.
@@ -59,6 +70,45 @@ or use option B instead.)
   that, the app starts in a few seconds.
 - Your browser opens at <http://127.0.0.1:8777>.
 
+### Windows
+
+You need Windows 10 or 11 on a 64-bit Intel or AMD PC. (The app has been checked on Windows by its
+automated tests, not yet by hand; if you try it, please open an issue either way.)
+
+1. On the GitHub page, click **Code → Download ZIP**. Right-click the ZIP and choose
+   **Extract All**. (Or, with Git: `git clone https://github.com/PMN123/bhajan-studio.git`.)
+2. In the extracted `bhajan-studio-main` folder, double-click **`start.bat`**. A console window
+   opens and runs the app.
+3. If Windows asks whether to run it ("Windows protected your PC", or "Open File – Security
+   Warning"), choose **More info → Run anyway**, or **Run**. To avoid the question, right-click the
+   ZIP before extracting it, choose **Properties**, tick **Unblock** and click **OK**.
+
+The first time, the launcher offers to install uv (into your user folder, no administrator rights
+needed), and uv downloads Python 3.12 and the app's packages (about 100 MB). Then your browser
+opens at <http://127.0.0.1:8777>.
+
+Reading the printed sargam labels and lyrics on the sheet music (OCR) uses
+[Tesseract](https://github.com/tesseract-ocr/tesseract) on Windows. It is optional: without it, the
+sheet is read from the notation alone. To add it, run `winget install UB-Mannheim.TesseractOCR` in a
+terminal (or use [its installer](https://github.com/UB-Mannheim/tesseract/wiki)), then restart
+Bhajan Studio.
+
+### Linux
+
+On a 64-bit Intel or AMD machine (Ubuntu, Debian, Fedora and the like):
+
+```bash
+git clone https://github.com/PMN123/bhajan-studio.git && cd bhajan-studio && ./start.sh
+```
+
+The launcher works as on macOS: it offers to install uv, uv sets up Python 3.12 and the packages
+(about 100 MB), and your browser opens. For OCR, install Tesseract: `sudo apt install tesseract-ocr`
+(Debian, Ubuntu) or `sudo dnf install tesseract` (Fedora). On 64-bit ARM Linux (a Raspberry Pi 5,
+say), the Rubber Band package has to be compiled there; use the [Docker image](#run-it-on-a-server-docker),
+which does that for you.
+
+### Good to know
+
 The piano and harmonium are real recorded samples, downloaded the first time you choose them (about
 3 MB each). The flute is synthesized and needs no download. Without internet, a synthesized piano
 or harmonium plays instead.
@@ -69,15 +119,34 @@ just its page and sheet music (about 0.6 MB, less than viewing it on sairhythms.
 (about 3 MB) is downloaded only when you click **Use the recording**. Everything is cached, so
 nothing is fetched twice, and the app never sends more than two requests to the site at a time.
 
+### Install it as an app
+
+Once Bhajan Studio is open in your browser, you can install it, so it gets its own window and an
+icon in the Dock, taskbar or Start menu:
+
+- **Chrome or Edge** (macOS, Windows, Linux): click the install icon at the right end of the
+  address bar, or choose **Install Bhajan Studio** in the browser's menu (in Chrome it is under
+  **Cast, save and share**).
+- **Safari** (macOS 14 or later): **File → Add to Dock**.
+
+The installed app is a window onto the Bhajan Studio server, so start that first, as usual (with
+`start.command`, `start.bat` or `./start.sh`), and keep the default port: the app remembers its
+address, <http://127.0.0.1:8777>.
+
+On a phone or tablet, install it from a [server](#run-it-on-a-server-docker) with an HTTPS address
+(browsers only install apps from `https://` addresses, or from the same computer): in Safari on
+iPhone or iPad, **Share → Add to Home Screen**; in Chrome on Android, **⋮ → Add to Home screen**.
+
 ## Everyday use
 
-- **Start:** double-click `start.command` (or run `./start.sh`).
-- **Stop:** press `Ctrl+C` in the Terminal window, or just close the window.
-- **Change the port:** run `./start.sh --port 9000`. If the port is already taken (by another app
-  or a second copy of Bhajan Studio), the next free port is used and its address is printed.
-  Nothing that is already running gets stopped.
+- **Start:** double-click `start.command` (macOS) or `start.bat` (Windows), or run `./start.sh`.
+- **Stop:** press `Ctrl+C` in the Terminal or console window, or just close the window.
+- **Change the port:** run `./start.sh --port 9000` (on Windows, `start.bat -Port 9000` in a
+  terminal). If the port is already taken (by another app or a second copy of Bhajan Studio), the
+  next free port is used and its address is printed. Nothing that is already running gets stopped.
 - **Other options:** `--no-open` (don't open the browser), `--yes` (install uv without asking),
-  `--no-install` (never install uv). Run `./start.sh --help` for the list.
+  `--no-install` (never install uv). Run `./start.sh --help` for the list. On Windows they are
+  `-NoOpen`, `-Yes`, `-NoInstall` and `-Help`.
 - **Update:** run `git pull` in the folder. If you used the ZIP, download a fresh one. You can
   move the old `data` folder into the new one to keep your cache.
 - **Cache:** everything the app downloads or works out goes in `data/` inside the folder. That
@@ -114,10 +183,13 @@ Recordings Sai Rhythms tags *golden voice* (Swami's own voice) are not split. Fo
 *karaoke* or *instrumental*, the card points to that official recording first: where it exists, it
 beats any split.
 
-**The first split** installs PyTorch and the separation runner (about 1 GB, into `.venv`) and
-downloads two separation models (about 1.6 GB, into `data/models`), so allow time for that on a
-slow connection. After that, a split takes about 1–3 minutes per bhajan on Apple Silicon, one
-recording at a time. Each split is kept, and so is each key you shift the parts to.
+**The first split** installs PyTorch and the separation runner (about 1 GB, into `.venv`; on Linux
+PyTorch also brings NVIDIA's CUDA libraries, several GB more) and downloads two separation models
+(about 1.6 GB, into `data/models`), so allow time for that on a slow connection. After that, a split
+takes about 1–3 minutes per bhajan on Apple Silicon or an NVIDIA GPU, and about three times the
+recording's length on a computer's CPU alone (13 minutes for a 4-minute bhajan on 8 cores), one
+recording at a time. Each split is kept, and so is each key you shift the
+parts to.
 
 **What to expect:** the parts are an AI separation of one finished recording, not separate
 microphones, so they are not studio-clean. The harmonium mostly doubles the sung melody, so a
@@ -126,18 +198,40 @@ recordings are 22 kHz mono MP3s at about 95 kbps, which also limits how clean th
 singing is the cleanest part; the tabla and harmonium split is the weakest, because no public model
 knows those instruments (pop-trained models hear a ringing dayan stroke as a guitar).
 
+## Run it on a server (Docker)
+
+To give a whole group one copy that they open in a browser, run Bhajan Studio on a Linux server
+with Docker. On the server:
+
+```bash
+git clone https://github.com/PMN123/bhajan-studio.git && cd bhajan-studio
+cp .env.example .env        # then put a strong password in it: BHAJAN_PASSWORD=...
+docker compose up -d
+```
+
+Then open `http://YOUR-SERVER:8777` and sign in with the password. To serve it over HTTPS on your
+own domain, set `DOMAIN` in `.env` and run `docker compose --profile https up -d` ([Caddy](https://caddyserver.com)
+gets the certificate by itself). There is also an override for NVIDIA GPUs (faster Parts) and a
+smaller image without Parts.
+
+[docs/DEPLOY.md](docs/DEPLOY.md) explains it all step by step: what size of server, HTTPS, the
+password and allowed host names, backups, updates, and GPUs. Before you share a hosted copy with a
+group, read its first section: the songs, recordings and sheet music belong to Sai Rhythms, so ask
+the owners first and keep the password on.
+
 ## How it works
 
 | Piece | File | Notes |
 |---|---|---|
-| Launcher | `start.sh`, `start.command`, `server.py` | Checks the macOS version and for uv (offers to install it), then `uv run` sets up Python 3.12 and the locked dependencies in `.venv` and starts the local server. The server listens on 127.0.0.1 only, answers only requests addressed to 127.0.0.1/localhost that don't come from other websites, picks the next free port if 8777 is busy, and opens your browser when it's ready. |
+| Launcher | `start.sh`, `start.command` (macOS, Linux), `start.bat`, `start.ps1` (Windows), `server.py` | Checks for uv (offers to install it) and, on macOS, the macOS version; then `uv run` sets up Python 3.12 and the locked dependencies in `.venv` and starts the local server. The server listens on 127.0.0.1 only, answers only requests addressed to 127.0.0.1/localhost that don't come from other websites, picks the next free port if 8777 is busy, and opens your browser when it's ready. |
+| Server mode | `server.py`, `Dockerfile`, `docker-compose.yml` | `--host` (or `BHAJAN_HOST`) listens on other addresses. `BHAJAN_PASSWORD` puts everything behind a sign-in page (a signed, HttpOnly cookie for 30 days; HTTP Basic auth for scripts), and `BHAJAN_ALLOWED_HOSTS` limits the host names it answers to. `/api/health` reports the version and whether Parts and OCR are available. The image runs as a non-root user with the cache in a `/data` volume, and waits 10 seconds between requests to Sai Rhythms. |
 | Sai Rhythms client | `bhajan/sairhythms.py` | Song index (3,600+ songs), song pages (lyrics, raga scale, reference pitches, range), recordings, and sheet PDFs. Everything is downloaded on demand and cached in `data/`. |
-| Sheet reader (OMR) | `bhajan/omr.py`, `bhajan/sheet.py` | Built for the Sai Samarpan engraving. Pitch comes from staff position plus accidentals. Rhythm comes from stems, beams, flags, dots, ties and rests. The printed sargam labels are OCR'd with macOS Vision (called through pyobjc) and used to confirm or correct each note. Lyrics are attached from the blue text. A read in which OCR failed is not cached, so it is redone once OCR works. |
+| Sheet reader (OMR) | `bhajan/omr.py`, `bhajan/sheet.py` | Built for the Sai Samarpan engraving. Pitch comes from staff position plus accidentals. Rhythm comes from stems, beams, flags, dots, ties and rests. The printed sargam labels are OCR'd (with macOS Vision, called through pyobjc, or with Tesseract elsewhere) and used to confirm or correct each note. Lyrics are attached from the blue text. A read in which OCR failed is not cached, so it is redone once OCR works. |
 | Key detection | `bhajan/audio.py` | Audio is decoded with the ffmpeg build bundled in imageio-ffmpeg. A YIN pitch tracker builds the recording's pitch-class profile, which is matched at all 12 rotations against the sheet's melody (when available) and the raga's scale. |
 | Pitch shift | `bhajan/audio.py` | The Rubber Band library through pylibrb, using its R3 ("finer") engine offline with formants preserved. The result is never louder than the original on average (RMS), and a gentle look-ahead limiter keeps peaks under −1 dBFS before MP3 encoding with the bundled ffmpeg. The limiter only acts on loudly mastered recordings (shifting brings back peaks their mastering had limited away), where it costs 1–2 dB of loudness. Shifts by the nearest interval by default, and can also correct the recording's tuning to A440. |
-| Parts | `bhajan/stems.py` | Two open separation models run one after the other through [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) on PyTorch (using the GPU on Apple Silicon): Mel-Band RoFormer splits singing from music, and BS-RoFormer SW's drums, cleaned by harmonic/percussive separation (held notes and drones go back to the harmonium), become the tabla. They run in a separate process, so the server never loads PyTorch and a split can be cancelled. Each stage keeps the exact remainder, so the parts add back up to the recording; they are stored at −6 dB as 24-bit FLAC so none can clip. All the parts are shifted together, as channels of one Rubber Band R3 stretcher with formants kept, so the bleed they share stays in phase and they still add up; the browser mixes the shifted parts live, and downloads get the same peak protection as the whole-recording shift. Session exports put each bhajan's full recording at −18 LUFS (ITU-R BS.1770 meter) and apply that gain to the chosen mix. |
+| Parts | `bhajan/stems.py` | Two open separation models run one after the other through [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) on PyTorch (using the GPU on Apple Silicon and NVIDIA's with CUDA, else the CPU): Mel-Band RoFormer splits singing from music, and BS-RoFormer SW's drums, cleaned by harmonic/percussive separation (held notes and drones go back to the harmonium), become the tabla. They run in a separate process, so the server never loads PyTorch and a split can be cancelled. Each stage keeps the exact remainder, so the parts add back up to the recording; they are stored at −6 dB as 24-bit FLAC so none can clip. All the parts are shifted together, as channels of one Rubber Band R3 stretcher with formants kept, so the bleed they share stays in phase and they still add up; the browser mixes the shifted parts live, and downloads get the same peak protection as the whole-recording shift. Session exports put each bhajan's full recording at −18 LUFS (ITU-R BS.1770 meter) and apply that gain to the chosen mix. |
 | Synth | `bhajan/synth.py`, `bhajan/instruments.py` | Synthesized flute (the default), recorded piano and harmonium samples (downloaded on first use, retuned, level-matched and looped), tanpura (Sa-Pa or Sa-Ma), and an optional click that follows the sheet's bars. Also writes MIDI with the matching General MIDI instrument. |
-| UI | `static/` | Vanilla JS, with [abcjs](https://www.abcjs.net/) vendored for staff notation |
+| UI | `static/` | Vanilla JS, with [abcjs](https://www.abcjs.net/) vendored for staff notation. A web app manifest and a small service worker (`sw.js`: the page shell is fetched network-first and cached only as an offline fallback; songs, audio and the API are never cached) make it installable as an app. |
 
 ### Accuracy
 
@@ -161,15 +255,17 @@ has sheet music. Without sheet music, it relies on the raga scale alone.
 
 ### Developer tools
 
-Run these from the repository folder. `uv run` uses the project's `.venv`, which has the Vision
-bindings that the OCR needs.
+Run these from the repository folder. `uv run` uses the project's `.venv` (which, on macOS, has
+the Vision bindings that the OCR needs).
 
 - `uv run server.py [--port N] [--host H] [--open]` starts the server directly. The `PORT`
   environment variable sets the default port, and `BHAJAN_DATA` moves the cache folder. `--host`
-  with anything other than 127.0.0.1 or localhost lets other devices on your network use the app,
-  with no password, so the server prints a warning.
+  (or `BHAJAN_HOST`) with anything other than 127.0.0.1 or localhost lets other devices use the
+  app; set `BHAJAN_PASSWORD` then, or the server prints a warning. `BHAJAN_ALLOWED_HOSTS` limits
+  the host names it answers to. `BHAJAN_SITE_GAP` (seconds, default 0.3) and `BHAJAN_SITE_SLOTS`
+  (default 2) pace the requests to Sai Rhythms. See [docs/DEPLOY.md](docs/DEPLOY.md).
 - `BHAJAN_OCR=auto|vision|tesseract|none` picks the OCR engine. `auto` (the default) uses Vision on
-  macOS, else tesseract if it is on PATH, else no OCR; the sheet is then read from the notation
+  macOS, else Tesseract if it is installed, else no OCR; the sheet is then read from the notation
   alone, without the label, lyric and tempo hints.
 - `uv run python tools/debug_omr.py page.png out.png` draws the detected notes on a rendered page.
 - `uv run python tools/score_omr.py [--ocr vision|tesseract|none] pages/*.png` prints
@@ -183,6 +279,15 @@ bindings that the OCR needs.
   reference values. The API checks use FastAPI's test client, which needs `httpx`; the app doesn't
   install it, so they are skipped with a message unless you run
   `uv run --extra stems --with httpx python tools/test_stems.py`.
+- `uv run python tools/test_server.py` starts the real server and checks the health check, the
+  sign-in page, its cookie and Basic auth, the allowed host names, the guard against other
+  websites, and the file types it serves.
+- `uv run python tools/make_icons.py` redraws the app icons in `static/icons/` (only needed if the
+  mark changes).
+- GitHub Actions runs the three test scripts and starts the app with its launcher on macOS, Linux
+  and Windows (`.github/workflows/ci.yml`), and builds and checks the Docker image
+  (`.github/workflows/docker.yml`). The image is published to ghcr.io only when the repository
+  owner runs that workflow by hand with **publish** ticked.
 
 ## Acknowledgements & licenses
 
@@ -197,7 +302,9 @@ bindings that the OCR needs.
   [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) (BSD-2-Clause), which is installed
   from PyPI.
 - **[PyMuPDF](https://pymupdf.readthedocs.io/)** (AGPL v3) renders the sheet PDFs, and
-  **[PyObjC](https://pyobjc.readthedocs.io/)** (MIT) connects to Apple's Vision framework for OCR.
+  **[PyObjC](https://pyobjc.readthedocs.io/)** (MIT) connects to Apple's Vision framework for OCR on
+  macOS. Elsewhere, OCR uses **[Tesseract](https://github.com/tesseract-ocr/tesseract)** (Apache 2.0)
+  if you install it; the Docker image includes it from Debian.
   The rest of the Python stack (FastAPI, Uvicorn, NumPy, SciPy, Pillow) is under permissive licenses.
 - **[audio-separator](https://github.com/nomadkaraoke/python-audio-separator)** (MIT) by Nomad
   Karaoke runs the separation models on **[PyTorch](https://pytorch.org/)** (BSD-style). Both are
@@ -209,6 +316,13 @@ bindings that the OCR needs.
     MIT ([source](https://huggingface.co/KimberleyJSN/melbandroformer)).
   - Tabla vs. harmonium: the BS-RoFormer SW model, as published by jarredou. No license is stated
     (its Hugging Face model card says `license: unknown`).
+- **Docker image.** Built from `python:3.12-slim-bookworm` (Debian). The optional HTTPS front end
+  is the official [Caddy](https://caddyserver.com) image (Apache 2.0), pulled when you use it. The
+  image bundles the GPL and AGPL software above (and, with Parts, diffq; see below), so this
+  repository doesn't publish one: everyone builds their own. See [docs/DEPLOY.md](docs/DEPLOY.md).
+- **App icons.** `static/icons/` holds PNG renderings of "ॐ" in Kohinoor Devanagari Bold (by the
+  Indian Type Foundry, shipped with macOS), made by `tools/make_icons.py`. The font itself is not
+  included.
 - **Sharing the app.** Share this repository (or its ZIP) and let uv download the packages, as the
   launcher does. A ready-made copy that includes `.venv` or the bundled binaries (a zipped folder,
   an `.app`) contains GPL and AGPL software and may only be passed on under those licenses' terms.
