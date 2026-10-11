@@ -1,0 +1,94 @@
+# Tests on macOS, Linux and Windows. Parts' PyTorch extra (about 1 GB) is not installed here: the split itself is
+# tested with a stand-in child process, and the Docker workflow imports the real packages.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_PYTHON_PREFERENCE: only-managed   # as the launchers do: uv's own Python, not the runner's
+      PYTHONIOENCODING: utf-8              # the tests print ॐ, ♭ and the like; Windows' console default is cp1252
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.12.4"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the base packages
+        run: uv sync --frozen --python 3.12
+
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+
+      - name: Parts checks
+        run: uv run --frozen --with httpx python tools/test_stems.py
+
+      - name: Synth checks
+        run: uv run --frozen python tools/test_synth.py
+
+      - name: Server checks
+        run: uv run --frozen python tools/test_server.py
+
+      - name: start.sh starts the app
+        if: runner.os != 'Windows'
+        run: |
+          bash -n start.sh
+          ./start.sh --help
+          ./start.sh --no-open --no-install --port 8790 > launcher.log 2>&1 &
+          pid=$!
+          ok=0
+          for _ in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:8790/api/health; then ok=1; break; fi
+            sleep 1
+          done
+          echo
+          test "$ok" = 1 && test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/)" = 200 || ok=0
+          kill "$pid" || true
+          cat launcher.log
+          test "$ok" = 1
+
+      - name: start.ps1 starts the app (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\start.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { $_.ToString() }; exit 1 }
+          .\start.ps1 -Help
+          $p = Start-Process powershell -PassThru -NoNewWindow -RedirectStandardOutput launcher.log -RedirectStandardError launcher.err `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'start.ps1', '-NoOpen', '-NoInstall', '-Port', '8790'
+          $ok = $false
+          for ($i = 0; $i -lt 120 -and -not $ok; $i++) {
+            try {
+              $ok = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://127.0.0.1:8790/api/health).StatusCode -eq 200
+              if ($ok) { $ok = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://127.0.0.1:8790/).StatusCode -eq 200 }
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          taskkill /T /F /PID $p.Id | Out-Null
+          Get-Content launcher.log, launcher.err
+          if (-not $ok) { exit 1 }
