@@ -1,0 +1,17 @@
+{
+  "name": "Bhajan Studio",
+  "short_name": "Bhajan Studio",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "description": "Transpose Sai bhajans to your key: read the sheet music, play it, or pitch-shift the real recording.",
+  "background_color": "#faf7f2",
+  "theme_color": "#c8691c",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "categories": ["music", "education"]
+}
