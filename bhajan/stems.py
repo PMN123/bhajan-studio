@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import json
 import math
+import atexit
+import importlib.util
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -405,10 +408,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STEMS_PACKAGES = ("audio_separator", "torch", "onnxruntime", "soundfile")
 
 
+WINDOWS = os.name == "nt"
+
+
 def _uv() -> str | None:
     exe = os.environ.get("UV") or shutil.which("uv")
     if not exe:
-        home = os.path.expanduser("~/.local/bin/uv")
+        home = os.path.expanduser("~/.local/bin/uv.exe" if WINDOWS else "~/.local/bin/uv")
         exe = home if os.path.exists(home) else None
     return exe
 
@@ -417,33 +423,59 @@ def child_command(*args: str) -> list[str]:
     """How to run `python -m bhajan.stems ARGS` with the separation packages available: directly
     when they are all installed, otherwise through uv, which installs the 'stems' extra first."""
     try:
-        import importlib.util
         if all(importlib.util.find_spec(m) is not None for m in STEMS_PACKAGES):
             return [sys.executable, "-m", "bhajan.stems", *args]
     except Exception:
         pass
     uv = _uv()
     if not uv:
-        raise RuntimeError("Splitting needs the 'stems' extra: run `uv sync --extra stems` in the Bhajan Studio folder.")
+        raise RuntimeError("Splitting needs the 'stems' extra: run `uv sync --extra stems` in the Bhajan Studio folder "
+                           "(or, for Docker, build the image with WITH_PARTS=1).")
     return [uv, "run", "--project", ROOT, "--frozen", "--extra", "stems", "--python", "3.12",
             "python", "-m", "bhajan.stems", *args]
 
 
-def _stop(proc: subprocess.Popen, grace: float = 10.0) -> None:
-    """SIGTERM the child's whole process group (uv, python, ffmpeg) so it can clean up; SIGKILL it
-    if it is still there after `grace` seconds (e.g. stuck in one long GPU call)."""
-    import signal
+def parts_available() -> bool:
+    """True if a split can run here: the separation packages are installed, or uv can install them."""
+    try:
+        child_command()
+        return True
+    except Exception:
+        return False
 
-    def send(sig):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
-    send(signal.SIGTERM)
+
+# The child (uv, python, ffmpeg) gets its own process group, so it can be stopped as a whole and the
+# Ctrl+C that stops the server is not also delivered to it.
+_GROUP = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {"start_new_session": True}
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """End the child and everything it started, at once."""
+    if WINDOWS:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _stop(proc: subprocess.Popen, grace: float = 10.0) -> None:
+    """Ask the child's whole process group to stop (SIGTERM; Ctrl+Break on Windows) so it can clean
+    up; kill it if it is still there after `grace` seconds (e.g. stuck in one long GPU call)."""
+    try:
+        if WINDOWS:
+            os.kill(proc.pid, signal.CTRL_BREAK_EVENT)    # goes to the child's group only
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except OSError:          # Windows, and the server has no console to send Ctrl+Break through
+        grace = 0            # (the work folder is removed by SplitJobs._run once the child is gone)
 
     def later():
         if proc.poll() is None:
-            send(signal.SIGKILL)
+            _kill(proc)
     t = threading.Timer(grace, later)
     t.daemon = True
     t.start()
@@ -459,6 +491,17 @@ class SplitJobs:
         self.cv = threading.Condition()
         self.proc: subprocess.Popen | None = None
         threading.Thread(target=self._worker, daemon=True, name="stems-split").start()
+        atexit.register(self._shutdown)
+
+    def _shutdown(self) -> None:
+        """The server is stopping: don't leave a split running on its own."""
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            _stop(proc, grace=5.0)
+            try:
+                proc.wait(6.0)
+            except subprocess.TimeoutExpired:
+                _kill(proc)
 
     def status(self, key: str, out_dir: str) -> dict:
         if read_manifest(out_dir):
@@ -514,7 +557,9 @@ class SplitJobs:
                     self.cv.wait()
                 key = self.queue.pop(0)
                 j = self.jobs[key]
-                j.update(state="running", started=time.time(), msg="Starting (the first split installs PyTorch, about 1 GB)")
+                installed = all(importlib.util.find_spec(m) is not None for m in STEMS_PACKAGES)
+                j.update(state="running", started=time.time(),
+                         msg="Starting" if installed else "Starting (the first split installs PyTorch, about 1 GB)")
             try:
                 self._run(j)
             except Exception as e:
@@ -532,7 +577,7 @@ class SplitJobs:
                     return
                 env = os.environ | {"PYTHONPATH": ROOT}       # find bhajan/ whatever the server's cwd
                 proc = self.proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                                                    stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+                                                    stderr=log, stdin=subprocess.DEVNULL, **_GROUP)
             try:
                 for line in proc.stdout:
                     try:
@@ -767,9 +812,34 @@ def export_session(items: list[dict], dst: str, gap_seconds: float = 4.0, lufs: 
 
 
 # ------------------------------------------------------------------ child entry point
+def ffmpeg_on_path(bin_dir: str) -> None:
+    """audio-separator (and pydub, which it imports) run `ffmpeg` by name and refuse to start without
+    one. Unless the system has ffmpeg, give the build bundled with imageio-ffmpeg that name, in
+    bin_dir, and put bin_dir first on PATH for this process and its children."""
+    if shutil.which("ffmpeg"):
+        return
+    exe = ffmpeg_exe()
+    link = os.path.join(bin_dir, "ffmpeg.exe" if WINDOWS else "ffmpeg")
+    try:
+        same = os.path.samefile(link, exe) if not WINDOWS else os.path.getsize(link) == os.path.getsize(exe)
+    except OSError:
+        same = False
+    if not same:
+        os.makedirs(bin_dir, exist_ok=True)
+        tmp = f"{link}.{os.getpid()}.part"
+        if WINDOWS:          # symlinks need administrator rights there: a hard link, or else a copy
+            try:
+                os.link(exe, tmp)
+            except OSError:
+                shutil.copy2(exe, tmp)
+        else:
+            os.symlink(exe, tmp)
+        os.replace(tmp, link)
+    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+
 def _main(argv: list[str]) -> int:
     import argparse
-    import signal
     ap = argparse.ArgumentParser(prog="python -m bhajan.stems")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("split", help="separate SRC into parts in DIR")
@@ -778,11 +848,13 @@ def _main(argv: list[str]) -> int:
     sp.add_argument("--models", required=True)
     a = ap.parse_args(argv)
     os.environ.setdefault("TORCH_HOME", os.path.join(a.models, "torch"))
+    ffmpeg_on_path(os.path.join(a.models, "bin"))    # before anything imports pydub
 
-    def stop(signum, frame):     # Cancel (SIGTERM) or a closed Terminal (SIGHUP): unwind so `finally`s clean up
-        raise SystemExit(128 + signum)
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGHUP, stop)
+    def stop(signum, frame):     # Cancel (SIGTERM; Ctrl+Break on Windows) or a closed Terminal (SIGHUP):
+        raise SystemExit(128 + signum)      # unwind so `finally`s clean up
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
 
     def emit(ev: dict) -> None:
         sys.stdout.write(json.dumps(ev) + "\n")

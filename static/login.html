@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Bhajan Studio</title>
+  <meta name="robots" content="noindex">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/favicon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon-180.png">
+  <!-- Shown by server.py, instead of the app, to a browser that has not signed in (BHAJAN_PASSWORD).
+       Self-contained: the app's own files need the password. -->
+  <style>
+    :root {
+      --bg: #faf7f2; --panel: #ffffff; --ink: #1f1c17; --muted: #6d665b; --line: #e7e0d4;
+      --accent: #c8691c; --accent-ink: #ffffff; --accent-soft: #fbeadb; --maroon: #8a2f2f;
+      --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #171512; --panel: #201d19; --ink: #f1ebe1; --muted: #a69c8d; --line: #36312a;
+        --accent: #e48a3c; --accent-ink: #1b1308; --accent-soft: #3a2a1b; --maroon: #e09a9a;
+        color-scheme: dark;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); }
+    main { max-width: 360px; margin: 14vh auto 0; padding: 0 16px; }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+    .mark { font-size: 34px; line-height: 1; color: var(--accent); }
+    h1 { font: 600 22px/1.2 var(--serif); margin: 0; }
+    p { margin: 0; color: var(--muted); }
+    form { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input[type=password] {
+      width: 100%; font: inherit; color: inherit; background: var(--bg); padding: 9px 12px;
+      border: 1px solid var(--line); border-radius: 10px; outline: none;
+    }
+    input[type=password]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    button {
+      margin-top: 14px; width: 100%; font: 600 15px var(--sans); padding: 10px; border: 0; border-radius: 10px;
+      background: var(--accent); color: var(--accent-ink); cursor: pointer;
+    }
+    .wrong { color: var(--maroon); margin-top: 10px; }
+    .note { font-size: 13px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">
+      <span class="mark" aria-hidden="true">ॐ</span>
+      <div>
+        <h1>Bhajan Studio</h1>
+        <p>Sai Rhythms bhajans in your own key</p>
+      </div>
+    </div>
+    <form method="post" action="/api/login">
+      <input type="text" name="username" value="bhajan-studio" autocomplete="username" hidden>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required autofocus>
+      <p class="wrong" id="wrong" hidden>That password is not right. Try again.</p>
+      <button type="submit">Sign in</button>
+      <p class="note">Ask whoever runs this copy of Bhajan Studio for the password. You stay signed in on
+        this device for 30 days.</p>
+    </form>
+  </main>
+  <script>
+    if (/[?&]wrong\b/.test(location.search)) {
+      document.getElementById("wrong").hidden = false;
+      history.replaceState(null, "", "/");
+    }
+  </script>
+</body>
+</html>

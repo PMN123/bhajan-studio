@@ -38,9 +38,18 @@ LETTER_PC = {"C": 0, "C#": 1, "DB": 1, "D": 2, "D#": 3, "EB": 3, "E": 4, "F": 5,
              "G": 7, "G#": 8, "AB": 8, "A": 9, "A#": 10, "BB": 10, "B": 11}
 
 
+def _env_number(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        return min(hi, max(lo, float(os.environ.get(name) or default)))
+    except ValueError:
+        return default
+
+
 # Be gentle with sairhythms.org: at most two requests in flight and a short gap between them.
-_SITE_SLOTS = threading.BoundedSemaphore(2)
-_SITE_GAP = 0.3
+# A server that many people use should wait longer (the Docker image sets BHAJAN_SITE_GAP=10, the
+# Crawl-delay in the site's robots.txt).
+_SITE_SLOTS = threading.BoundedSemaphore(int(_env_number("BHAJAN_SITE_SLOTS", 2, 1, 8)))
+_SITE_GAP = _env_number("BHAJAN_SITE_GAP", 0.3, 0, 60)
 _site_last = [0.0]
 _site_lock = threading.Lock()
 SNAPSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "song_index.json.gz")

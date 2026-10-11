@@ -23,6 +23,7 @@ const state = {
 /* ---------------------------------------------------------------- utils */
 async function api(path, opts = {}) {
   const r = await fetch(path, opts);
+  if (r.status === 401) location.reload();   // signed out of a password-protected server: show the sign-in page
   if (!r.ok) {
     let msg = r.statusText;
     try {

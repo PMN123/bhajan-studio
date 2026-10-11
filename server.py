@@ -1,11 +1,19 @@
 """Bhajan Studio: transpose Sai Rhythms bhajans to your key.
 
-Run:  ./start.sh                      (installs what it needs, opens your browser)
+Run:  ./start.sh  or  start.bat       (installs what it needs, opens your browser)
   or  uv run server.py [--open] [--port N] [--host H]
 
 The PORT environment variable sets the default port (8777). If the port is busy, the next free
 one (up to +20) is used and printed. The server only listens on this computer (127.0.0.1) unless
---host says otherwise.
+--host (or BHAJAN_HOST) says otherwise.
+
+On a server (see docs/DEPLOY.md):
+  BHAJAN_PASSWORD       every request needs this password, except /api/health and the files a
+                        browser needs to install the app: browsers get a sign-in page (and a
+                        30-day cookie), scripts can send it as HTTP Basic auth (any user name)
+  BHAJAN_ALLOWED_HOSTS  comma-separated host names the server answers to, e.g. bhajans.example.org
+                        (127.0.0.1 and localhost always work); unset = any name, when listening publicly
+  BHAJAN_DATA           the cache folder (default: data/ next to this file)
 """
 from __future__ import annotations
 
@@ -13,15 +21,22 @@ if __name__ == "__main__":  # say something before the heavy imports below
     print("Starting Bhajan Studio...", flush=True)
 
 import argparse
+import asyncio
+import base64
 import errno
+import functools
 import hashlib
+import hmac
 import json
+import mimetypes
 import os
+import re
 import shutil
 import socket
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import webbrowser
@@ -29,8 +44,8 @@ from typing import Literal
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -48,6 +63,19 @@ SHIFT_VERSION = "pylibrb-r3-limiter-1"   # change when pitch_shift's output chan
 KEY_VERSION = 3                          # same for analyze_key's result
 os.makedirs(MEDIA, exist_ok=True)
 os.makedirs(STEMS, exist_ok=True)
+PASSWORD = os.environ.get("BHAJAN_PASSWORD", "")
+try:
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
+        VERSION = tomllib.load(f)["project"]["version"]
+except (OSError, KeyError, tomllib.TOMLDecodeError):
+    VERSION = "unknown"
+
+# Python takes file types from the Windows registry, where .js or .css can be text/plain (browsers
+# then refuse the stylesheet); say them here so every platform serves the same types.
+for _ext, _type in {".js": "text/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml",
+                    ".png": "image/png", ".webmanifest": "application/manifest+json", ".json": "application/json",
+                    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac", ".mid": "audio/midi"}.items():
+    mimetypes.add_type(_type, _ext)
 
 Instrument = Literal["flute", "piano", "harmonium"]
 
@@ -192,6 +220,21 @@ def _prune_media(cap: int = MEDIA_CAP) -> None:
 
 
 # ------------------------------------------------------------------ routes
+@functools.cache
+def _ocr_engine() -> str:
+    from bhajan import omr
+    try:
+        return omr.ocr_engine()
+    except ValueError:      # a misspelt BHAJAN_OCR: reading a sheet says so
+        return "none"
+
+
+@app.get("/api/health")
+def health():
+    """For uptime checks and Docker's HEALTHCHECK: needs no password, and says nothing about bhajans."""
+    return {"ok": True, "version": VERSION, "parts": stems.parts_available(), "ocr": _ocr_engine()}
+
+
 @app.get("/api/search")
 def search(q: str = "", limit: int = Query(40, ge=1, le=200)):
     return sr.search(q, limit)
@@ -668,7 +711,8 @@ def _prune_stems(cap: int = STEMS_CAP) -> None:
 
 
 # Only this computer's own browser may use the app: the Host check stops DNS-rebinding pages, and
-# the Origin / Sec-Fetch-Site checks stop other websites from driving the API through the browser.
+# the Origin / Sec-Fetch-Site checks stop other websites from driving the API through the browser
+# (which matters on a server too: browsers send a saved password along with other sites' requests).
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 _allow_any_host = False   # set by main() when the user explicitly listens on another address
 
@@ -680,13 +724,86 @@ def _host_name(host: str) -> str:
     return host.split(":", 1)[0]
 
 
+# A reverse proxy on the same computer (Caddy, nginx) passes on the public name, so names listed here
+# are accepted on any address; when listening publicly, they are the only ones (if any are listed).
+ALLOWED_HOSTS = {_host_name(h) for h in os.environ.get("BHAJAN_ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+def _host_ok(host: str) -> bool:
+    name = _host_name(host)
+    return name in _LOCAL_HOSTS or name in ALLOWED_HOSTS or (_allow_any_host and not ALLOWED_HOSTS)
+
+
+# With BHAJAN_PASSWORD, a browser without the sign-in cookie gets static/login.html instead of the
+# app (a 200, so hosts that check the home page, such as Replit, see the app is up), and every other
+# request a 401. Scripts and uptime monitors can send the password as HTTP Basic auth instead.
+# What a browser fetches without the password: the health check, the sign-in page and what it needs
+# to offer to install the app (it asks for the manifest and icons without credentials). None of it
+# is private.
+_PUBLIC_PATHS = {"/api/health", "/login.html", "/manifest.webmanifest", "/sw.js"}
+_PUBLIC_RE = re.compile(r"/icons/[A-Za-z0-9_-]+\.(?:png|svg|ico)")
+SESSION_COOKIE = "bhajan_session"
+SESSION_DAYS = 30
+
+
+def _session_token(issued: int) -> str:
+    """'<time issued>.<signature>': only this password can sign one, and a new password ends them all."""
+    key = hashlib.sha256(b"bhajan-studio session\0" + PASSWORD.encode()).digest()
+    return f"{issued}.{hmac.new(key, str(issued).encode(), 'sha256').hexdigest()}"
+
+
+def _signed_in(request) -> bool:
+    token = request.cookies.get(SESSION_COOKIE, "")
+    issued = token.partition(".")[0]
+    if issued.isascii() and issued.isdigit() and time.time() - int(issued) < SESSION_DAYS * 86400:
+        return hmac.compare_digest(token, _session_token(int(issued)))
+    scheme, _, cred = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        _, sep, given = base64.b64decode(cred.strip(), validate=True).decode("utf-8").partition(":")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return bool(sep) and hmac.compare_digest(given.encode(), PASSWORD.encode())
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    """The sign-in page's form. A wrong password costs a second, to slow down guessing."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > 4096:
+            break
+    given = urllib.parse.parse_qs(body[:4096].decode("utf-8", "replace")).get("password", [""])[0]
+    if PASSWORD and not hmac.compare_digest(given.encode(), PASSWORD.encode()):
+        await asyncio.sleep(1)
+        return RedirectResponse("/?wrong", status_code=303)
+    resp = RedirectResponse("/", status_code=303)
+    if PASSWORD:
+        https = request.url.scheme == "https" or \
+            request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https"
+        resp.set_cookie(SESSION_COOKIE, _session_token(int(time.time())), max_age=SESSION_DAYS * 86400,
+                        path="/", httponly=True, samesite="lax", secure=https)
+    return resp
+
+
 @app.middleware("http")
 async def _guard_and_revalidate(request, call_next):
     host = request.headers.get("host", "")
-    if not _allow_any_host and _host_name(host) not in _LOCAL_HOSTS:
-        return JSONResponse({"detail": "Bhajan Studio only answers requests addressed to 127.0.0.1 or localhost."},
-                            status_code=403)
-    if request.url.path.startswith(("/api/", "/stems/")):   # /stems: other sites may not probe which bhajans were split
+    path = request.scope["path"]
+    public = (request.method in ("GET", "HEAD") and (path in _PUBLIC_PATHS or _PUBLIC_RE.fullmatch(path))) or \
+        (request.method == "POST" and path == "/api/login")
+    if not _host_ok(host) and path != "/api/health":     # load balancers check health by IP address
+        msg = ("This server does not answer to that host name (see BHAJAN_ALLOWED_HOSTS)." if _allow_any_host or ALLOWED_HOSTS
+               else "Bhajan Studio only answers requests addressed to 127.0.0.1 or localhost.")
+        return JSONResponse({"detail": msg}, status_code=403)
+    if PASSWORD and not public and not _signed_in(request):
+        if request.method in ("GET", "HEAD") and path in ("/", "/index.html"):
+            return FileResponse(os.path.join(ROOT, "static", "login.html"), media_type="text/html",
+                                headers={"Cache-Control": "no-store"})
+        return JSONResponse({"detail": "Sign in to Bhajan Studio first (reload the page)."}, status_code=401)
+    if path.startswith(("/api/", "/stems/")):   # /stems: other sites may not probe which bhajans were split
         site = request.headers.get("sec-fetch-site")
         origin = request.headers.get("origin")
         if (site and site not in ("same-origin", "none")) or \
@@ -789,10 +906,10 @@ def main(argv: list[str] | None = None) -> None:
             raise argparse.ArgumentTypeError(f"port must be between 1 and 65535, not {n}")
         return n
 
-    ap = argparse.ArgumentParser(description="Run the Bhajan Studio web app on this computer.")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="address to listen on (default: 127.0.0.1, this computer only). Anything else "
-                         "lets other devices on your network use the app, with no password.")
+    ap = argparse.ArgumentParser(description=f"Run the Bhajan Studio web app (version {VERSION}).")
+    ap.add_argument("--host", default=os.environ.get("BHAJAN_HOST") or "127.0.0.1",
+                    help="address to listen on (default: $BHAJAN_HOST or 127.0.0.1, this computer only). "
+                         "Anything else, e.g. 0.0.0.0, lets other devices use the app: set BHAJAN_PASSWORD then.")
     ap.add_argument("--port", type=port_number, default=os.environ.get("PORT") or "8777",
                     help="port to listen on; if it is busy the next free one is used (default: $PORT or 8777)")
     ap.add_argument("--open", action="store_true", help="open the app in the default browser once it is ready")
@@ -809,7 +926,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"Bhajan Studio could not listen on {args.host}:{port}: {e}")
     if sock is None:
         sys.exit(f"Bhajan Studio could not start: ports {args.port}-{last} are all in use.\n"
-                 f"Pick another one, e.g.  ./start.sh --port 9000")
+                 "Pick another one, e.g.  " + ("start.bat -Port 9000" if os.name == "nt" else "./start.sh --port 9000"))
 
     port = sock.getsockname()[1]
     url = f"http://{_browser_host(args.host)}:{port}"
@@ -819,8 +936,16 @@ def main(argv: list[str] | None = None) -> None:
                   "(Is Bhajan Studio already open in another window?)"]
     if args.host.strip().lower() not in _LOCAL_HOSTS | {"::1"}:
         _allow_any_host = True
-        notes.append(f"WARNING: listening on {args.host or 'all interfaces'}, so other devices on your "
-                     "network can use this app too (there is no password).")
+        where = args.host or "all interfaces"
+        if PASSWORD:
+            notes.append(f"Listening on {where}; other devices need the password (BHAJAN_PASSWORD).")
+        else:
+            notes.append(f"WARNING: listening on {where} with no password, so anyone who can reach this "
+                         "computer can use the app. Set BHAJAN_PASSWORD to require one.")
+        if ALLOWED_HOSTS:
+            notes.append("Answers to: " + ", ".join(sorted(ALLOWED_HOSTS | _LOCAL_HOSTS)))
+    elif PASSWORD:
+        notes.append("Password required (BHAJAN_PASSWORD).")
     _prune_media()
 
     server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=port, log_level="warning"))

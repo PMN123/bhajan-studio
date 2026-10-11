@@ -47,8 +47,8 @@ def sargam_name(midi: int, sa: int = 60) -> str:
 # Printed sargam labels, lyrics and the tempo mark are read with Apple's Vision
 # framework, called in-process through PyObjC (no compiler or Homebrew needed).
 # BHAJAN_OCR=auto|vision|tesseract|none picks the engine; auto = Vision when it
-# can be imported, else tesseract if it is on PATH, else no OCR (the OMR still
-# works from the notation alone, just without label/lyric/tempo hints).
+# can be imported (macOS), else tesseract if it is installed, else no OCR (the OMR
+# still works from the notation alone, just without label/lyric/tempo hints).
 OCR_ENGINES = ("auto", "vision", "tesseract", "none")
 _VISION = None          # namespace of PyObjC symbols once resolved; False if unavailable
 _VISION_LOCK = threading.Lock()
@@ -82,6 +82,18 @@ def _vision_api():
     return _VISION or None
 
 
+def _tesseract() -> str | None:
+    """The tesseract program: on PATH, or where its Windows installer puts it (not on PATH)."""
+    exe = shutil.which("tesseract")
+    if exe is None and os.name == "nt":
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            p = os.path.join(base or "", "Tesseract-OCR", "tesseract.exe")
+            if base and os.path.exists(p):
+                return p
+    return exe
+
+
 def _ocr_choice(engine: str | None) -> str:
     eng = (engine or os.environ.get("BHAJAN_OCR") or "auto").strip().lower()
     if eng not in OCR_ENGINES:
@@ -96,7 +108,7 @@ def ocr_engine(engine: str | None = None) -> str:
         return eng
     if _vision_api():
         return "vision"
-    return "tesseract" if shutil.which("tesseract") else "none"
+    return "tesseract" if _tesseract() else "none"
 
 
 def run_ocr(png_path: str, engine: str | None = None) -> list[dict]:
@@ -113,8 +125,8 @@ def run_ocr(png_path: str, engine: str | None = None) -> list[dict]:
             _log.warning("Vision OCR failed on %s (%s); trying tesseract", png_path, e)
             return tesseract_ocr(png_path)
     if eng == "tesseract":
-        if choice != "auto" and not shutil.which("tesseract"):
-            raise RuntimeError("BHAJAN_OCR=tesseract but tesseract is not on PATH")
+        if choice != "auto" and not _tesseract():
+            raise RuntimeError("BHAJAN_OCR=tesseract but tesseract is not installed (or not on PATH)")
         return tesseract_ocr(png_path)
     return []
 
@@ -169,8 +181,8 @@ def vision_ocr(png_path: str) -> list[dict]:
 
 def tesseract_ocr(png_path: str) -> list[dict]:
     try:
-        r = subprocess.run(["tesseract", png_path, "-", "--psm", "11", "tsv"],
-                           capture_output=True, timeout=120, text=True)
+        r = subprocess.run([_tesseract() or "tesseract", png_path, "-", "--psm", "11", "tsv"],
+                           capture_output=True, timeout=120, encoding="utf-8", errors="replace")
     except Exception:
         return []
     out = []

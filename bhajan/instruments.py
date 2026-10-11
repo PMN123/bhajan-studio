@@ -260,7 +260,7 @@ def ensure(instrument: str) -> dict:
             meta = None
             if os.path.exists(meta_path):
                 try:
-                    with open(meta_path) as f:
+                    with open(meta_path, encoding="utf-8") as f:
                         meta = json.load(f)
                     if meta.get("version") != ANALYSIS_VERSION or meta.get("sha256") != src.sha256:
                         meta = None

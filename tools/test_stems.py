@@ -491,24 +491,35 @@ from bhajan import stems
 class Separator:
     def __init__(self, output_dir, **kw):
         print(json.dumps({"work": output_dir}), flush=True)
-        time.sleep(60)
+        for _ in range(600):     # short sleeps: Windows runs a Ctrl+Break handler only once a sleep ends
+            time.sleep(0.1)
 for name in ("audio_separator", "audio_separator.separator", "soundfile"):
     sys.modules[name] = types.ModuleType(name)
 sys.modules["audio_separator.separator"].Separator = Separator
 stems._patch_separator = lambda emit: None
 sys.exit(stems._main(sys.argv[1:]))
 """)
-for sig in (signal.SIGTERM, signal.SIGHUP):
+# Windows has no SIGTERM or SIGHUP to send: Cancel sends Ctrl+Break to the child's process group there instead.
+WINDOWS = os.name == "nt"
+for sig in ((signal.SIGBREAK,) if WINDOWS else (signal.SIGTERM, signal.SIGHUP)):
     out = os.path.join(td, "sig", sig.name)
     p = subprocess.Popen([sys.executable, sig_child, "split", paths0["voice"], out, "--models", os.path.join(td, "models")],
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ | {"PYTHONPATH": stems.ROOT})
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ | {"PYTHONPATH": stems.ROOT},
+                         **stems._GROUP)
     killer = threading.Timer(30, p.kill)          # never hang the suite if the child does not get that far
     killer.start()
     line = p.stdout.readline()
     work = json.loads(line)["work"] if line.startswith(b"{") else ""
     ready = os.path.basename(work).startswith("split-") and os.path.isdir(work)
     check(ready, f"{sig.name}: the stand-in split reaches its work folder", line)
-    p.send_signal(sig)
+    try:
+        p.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else sig)
+    except OSError as e:          # Windows without a console: Ctrl+Break cannot be sent (Cancel then kills the child)
+        p.kill()
+        p.communicate()
+        killer.cancel()
+        print(f"SKIP child signal checks (Ctrl+Break could not be sent: {e})")
+        break
     try:
         _, err = p.communicate(timeout=10)
     except subprocess.TimeoutExpired:
@@ -519,7 +530,27 @@ for sig in (signal.SIGTERM, signal.SIGHUP):
           f"exit {p.returncode}: {err.decode(errors='replace').strip()[-300:]}")
     left = [n for n in os.listdir(out) if n.startswith("split-")] if os.path.isdir(out) else []
     check(ready and not left, f"{sig.name}: the child removes its split-* work folder", left)
-section("child signals", "SIGTERM and SIGHUP end a split with its work folder removed")
+section("child signals", ("Ctrl+Break ends" if WINDOWS else "SIGTERM and SIGHUP end") + " a split with its work folder removed")
+
+# ------------------------------------------------------------------ ffmpeg for audio-separator
+# Regression: audio-separator runs `ffmpeg -version` by name and refuses to split without it, so a split only worked
+# where ffmpeg happened to be installed (Homebrew); in the Docker image, on Windows and on a fresh Mac it failed at
+# once. The child now puts the ffmpeg bundled with imageio-ffmpeg on PATH under that name.
+saved_path = os.environ.get("PATH", "")
+no_ffmpeg = os.path.join(td, "no-ffmpeg")       # a PATH with nothing on it, as on a machine without ffmpeg
+os.makedirs(no_ffmpeg)
+try:
+    bin_dir = os.path.join(td, "models", "bin")
+    for attempt in ("made", "reused"):
+        os.environ["PATH"] = no_ffmpeg
+        stems.ffmpeg_on_path(bin_dir)
+        found = shutil.which("ffmpeg")
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True) if found else None
+        check(found is not None and os.path.dirname(found) == bin_dir and r.returncode == 0
+              and r.stdout.startswith("ffmpeg version"), f"`ffmpeg` runs the bundled build when it is {attempt}", found)
+finally:
+    os.environ["PATH"] = saved_path
+section("ffmpeg on PATH", "the bundled ffmpeg answers to `ffmpeg` for audio-separator")
 
 # ------------------------------------------------------------------ model download
 # Regression: audio-separator writes a model in place and skips any file already there, so a download that was
