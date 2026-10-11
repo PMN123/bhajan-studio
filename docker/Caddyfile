@@ -1,0 +1,9 @@
+# HTTPS in front of Bhajan Studio (used by the "https" profile in docker-compose.yml).
+# DOMAIN comes from .env. Caddy gets and renews the Let's Encrypt certificate by itself;
+# ports 80 and 443 must be reachable from the internet, and DOMAIN's DNS A record must
+# point at this server.
+{$DOMAIN} {
+	encode zstd gzip
+	# The Host header is passed through unchanged, so DOMAIN must also be in BHAJAN_ALLOWED_HOSTS.
+	reverse_proxy bhajan-studio:8777
+}

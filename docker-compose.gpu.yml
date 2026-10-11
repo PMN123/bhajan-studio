@@ -1,0 +1,22 @@
+# NVIDIA GPU override for Parts (splitting a recording into singing, tabla, harmonium).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Needs an NVIDIA driver and the NVIDIA Container Toolkit on the host. Builds PyTorch with CUDA 13.0
+# instead of the CPU build (driver 580 or newer, GPUs from the GTX 16 / RTX 20 series on). The image
+# becomes several GB larger. For an older driver or GPU, put this in .env and build again:
+#   TORCH_INDEX=https://download.pytorch.org/whl/cu126     (CUDA 12.6: driver 525+, not RTX 50 series)
+# See docs/DEPLOY.md.
+services:
+  bhajan-studio:
+    build:
+      args:
+        TORCH_INDEX: ${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}
+    image: bhajan-studio:gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

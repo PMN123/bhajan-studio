@@ -1,0 +1,71 @@
+# Bhajan Studio on a server. See docs/DEPLOY.md.
+#
+#   cp .env.example .env        # then edit .env: BHAJAN_PASSWORD is required
+#   docker compose up -d        # plain HTTP on port 8777
+#   docker compose --profile https up -d      # HTTPS on your own domain, through Caddy
+#
+# NVIDIA GPU:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+name: bhajan-studio
+
+services:
+  bhajan-studio:
+    build:
+      context: .
+      args:
+        # 0 = leave out Parts (the splitting): a much smaller image.
+        WITH_PARTS: ${WITH_PARTS:-1}
+    image: bhajan-studio:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      # BHAJAN_BIND=127.0.0.1 keeps the app off the public network (use it with the https profile).
+      - "${BHAJAN_BIND:-0.0.0.0}:${BHAJAN_PORT:-8777}:8777"
+    volumes:
+      - bhajan-data:/data
+    environment:
+      # Compose refuses to start without a password: a public server must not be open.
+      BHAJAN_PASSWORD: ${BHAJAN_PASSWORD:?Set BHAJAN_PASSWORD in .env}
+      BHAJAN_ALLOWED_HOSTS: ${BHAJAN_ALLOWED_HOSTS:-}
+      # Seconds between requests to sairhythms.org (their robots.txt asks for 10).
+      BHAJAN_SITE_GAP: ${BHAJAN_SITE_GAP:-10}
+      BHAJAN_OCR: ${BHAJAN_OCR:-auto}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8777/api/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  # HTTPS with an automatic Let's Encrypt certificate. Only starts with:  --profile https
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on:
+      bhajan-studio:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    # Same as the image's own command, but with a clear message if DOMAIN is not set.
+    command:
+      - sh
+      - -c
+      - 'test -n "$$DOMAIN" || { echo "Set DOMAIN in .env to the domain name for the https profile."; exit 1; }; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  bhajan-data:
+  caddy-data:
+  caddy-config:

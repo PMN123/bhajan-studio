@@ -1,0 +1,42 @@
+# Keep the build context small: only the app's source goes to the builder.
+# (The Dockerfile copies named files, so these mostly save upload time, and keep
+# your caches, secrets and virtualenv out of the image.)
+
+# Version control
+.git
+.gitignore
+
+# Local Python environments and caches
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.ruff_cache
+.pytest_cache
+.mypy_cache
+*.egg-info
+
+# The app's local cache (recordings, models, stems, ...). The image starts empty; /data is a volume.
+data
+
+# Secrets and local configuration
+.env
+.env.*
+
+# Partial downloads, OS junk, editor files
+*.part
+.DS_Store
+.idea
+.vscode
+
+# Docs build output, working notes, build output
+docs/_build
+site
+build
+dist
+parts-notes
+
+# Deployment files themselves are not part of the image
+docker-compose*.yml
+docker
