@@ -81,6 +81,7 @@ $("#results").addEventListener("click", (e) => {
 
 /* ---------------------------------------------------------------- song */
 async function openSong(slug) {
+  document.dispatchEvent(new CustomEvent("bs:song"));
   stopHighlight();
   Object.assign(state, { slug, song: null, analysis: null, recWanted: false, recSa: null, audioI: 0, dirAlt: false, shifted: {}, score: null, sheetI: 0, timings: null, rendered: null, cur: -1, octave: 0 });
   history.replaceState(null, "", "#" + encodeURIComponent(slug));
@@ -202,6 +203,7 @@ function shiftPlan() {
 const stepsText = (n) => n === 0 ? "no change" : `${n > 0 ? "up" : "down"} ${Math.abs(n)} semitone${Math.abs(n) === 1 ? "" : "s"}`;
 
 function renderRec() {
+  queueMicrotask(() => document.dispatchEvent(new CustomEvent("bs:rec")));   // once this render is done, whichever way it returns
   const s = state.song, body = $("#recbody");
   if (!s) return;
   if (!s.audio.length) { body.innerHTML = `<p class="hint">Sai Rhythms has no recording for this bhajan, so only the sheet-music version is available.</p>`; return; }

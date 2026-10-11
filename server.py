@@ -17,6 +17,7 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -33,20 +34,25 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from bhajan import audio, sheet, store
+from bhajan import audio, sheet, stems, store
 from bhajan.sairhythms import SaiRhythms, canonical_slug
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("BHAJAN_DATA", os.path.join(ROOT, "data"))
 MEDIA = os.path.join(DATA, "media")
 MEDIA_CAP = 500 * 1024 * 1024   # rendered/shifted audio kept in data/media; least recently used goes first
+STEMS = os.path.join(DATA, "stems")     # split parts, one folder per recording (with its shifted copies)
+STEMS_CAP = 3 * 1024 ** 3               # least recently used recordings' parts go first
+MODELS = os.path.join(DATA, "models")   # separation model weights, downloaded on first split
 SHIFT_VERSION = "pylibrb-r3-limiter-1"   # change when pitch_shift's output changes, to re-shift
 KEY_VERSION = 3                          # same for analyze_key's result
 os.makedirs(MEDIA, exist_ok=True)
+os.makedirs(STEMS, exist_ok=True)
 
 Instrument = Literal["flute", "piano", "harmonium"]
 
 sr = SaiRhythms(DATA)
+splits = stems.SplitJobs(MODELS)
 app = FastAPI(title="Bhajan Studio")
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -338,6 +344,329 @@ def shift(slug: str, req: ShiftReq):
     return {"audio_url": f"/media/{key}.mp3"}
 
 
+# ------------------------------------------------------------------ parts (singing / tabla / harmonium)
+def _parts_dir(slug: str, audio_i: int) -> tuple[str, str, str]:
+    """(folder of the split parts, local recording path, job key) for recording audio_i."""
+    src, url = _recording(slug, audio_i)
+    key = _h("stems", canonical_slug(slug), url, stems.STEMS_VERSION)
+    return os.path.join(STEMS, key), src, key
+
+
+def _song_tags(slug: str) -> set[str]:
+    slug = canonical_slug(slug)
+    try:
+        return next((set(t.lower() for t in x.get("tags", [])) for x in sr.index() if x["slug"] == slug), set())
+    except Exception:
+        return set()
+
+
+# Recordings of Swami's own voice are not taken apart. Songs Sai Rhythms tags "karaoke" or
+# "instrumental" already have an official accompaniment recording, which beats any split.
+NO_SPLIT_TAGS = {"golden voice"}
+OFFICIAL_TAGS = {"karaoke", "instrumental"}
+
+
+def _parts_status(d: str, key: str, slug: str = "") -> dict:
+    tags = _song_tags(slug) if slug else set()
+    if tags & NO_SPLIT_TAGS:
+        return {"state": "unavailable",
+                "msg": "This is a recording of Swami's own voice, so Bhajan Studio does not split it into parts."}
+    s = splits.status(key, d)
+    if tags & OFFICIAL_TAGS:
+        s["official"] = sorted(tags & OFFICIAL_TAGS)
+    m = stems.read_manifest(d) if s["state"] == "done" else None
+    if m:
+        s |= {"parts": [{"id": p, "label": stems.LABELS[p], "share_db": m["parts"][p]["share_db"]} for p in stems.PARTS],
+              "models": m["models"], "seconds": m["seconds"], "sr": m["sr"]}
+    return s
+
+
+@app.get("/api/song/{slug}/parts")
+def parts_status(slug: str, audio_i: int = Query(0, ge=0)):
+    if _song_tags(slug) & NO_SPLIT_TAGS:          # answer before downloading anything
+        return _parts_status("", "", slug)
+    d, _, key = _parts_dir(slug, audio_i)
+    return _parts_status(d, key, slug)
+
+
+@app.post("/api/song/{slug}/parts")
+def parts_split(slug: str, audio_i: int = Query(0, ge=0)):
+    if _song_tags(slug) & NO_SPLIT_TAGS:
+        raise HTTPException(403, "This is a recording of Swami's own voice, so Bhajan Studio does not split it into parts.")
+    d, src, key = _parts_dir(slug, audio_i)
+    splits.start(key, src, d)
+    _prune_stems()
+    return _parts_status(d, key, slug)
+
+
+@app.delete("/api/song/{slug}/parts")
+def parts_cancel(slug: str, audio_i: int = Query(0, ge=0)):
+    d, _, key = _parts_dir(slug, audio_i)
+    splits.cancel(key)
+    return _parts_status(d, key, slug)
+
+
+class PartsReq(BaseModel):
+    audio_i: int = Field(0, ge=0)
+    semitones: float = Field(0, ge=-12.5, le=12.5)
+    tempo: float = Field(1.0, ge=0.7, le=1.3)
+
+
+def _shifted(d: str, semitones: float, tempo: float) -> tuple[dict[str, str], float]:
+    try:
+        return stems.shifted_parts(d, round(semitones, 3), round(tempo, 3))
+    finally:
+        _prune_stems()
+
+
+@app.post("/api/song/{slug}/parts/render")
+def parts_render(slug: str, req: PartsReq):
+    """Every part in the requested key and tempo, for the browser to mix live."""
+    d, _, _ = _parts_dir(slug, req.audio_i)
+    m = stems.read_manifest(d)
+    if not m:
+        raise HTTPException(409, "Split the recording into parts first.")
+    try:
+        paths, gain = _shifted(d, req.semitones, req.tempo)
+    except Exception as e:
+        raise HTTPException(500, f"Could not shift the parts: {e}")
+    return {"gain": gain, "sr": m["sr"],
+            "urls": {p: "/stems/" + os.path.relpath(paths[p], STEMS).replace(os.sep, "/") for p in stems.PARTS}}
+
+
+class MixReq(PartsReq):
+    gains: dict[str, float | None] = Field(default_factory=dict)   # dB per part; null = muted
+
+
+def _clean_gains(g: dict[str, float | None]) -> dict[str, float | None]:
+    bad = set(g) - set(stems.PARTS)
+    if bad:
+        raise HTTPException(422, f"Unknown part(s): {', '.join(sorted(bad))}")
+    gains = {p: (None if v is None else max(-60.0, min(12.0, float(v)))) for p, v in g.items()}
+    if all(gains.get(p, 0.0) is None for p in stems.PARTS):
+        raise HTTPException(422, "Every part is muted, so there is nothing to export.")
+    return gains
+
+
+@app.post("/api/song/{slug}/parts/mix")
+def parts_mix(slug: str, req: MixReq):
+    """Render the chosen mix of parts to an MP3 (for download)."""
+    d, _, _ = _parts_dir(slug, req.audio_i)
+    m = stems.read_manifest(d)
+    if not m:
+        raise HTTPException(409, "Split the recording into parts first.")
+    gains = _clean_gains(req.gains)
+    key = _h("partsmix", d, round(req.semitones, 3), round(req.tempo, 3), gains, stems.SHIFT_VERSION)
+    dst = os.path.join(MEDIA, key + ".mp3")
+    with _lock(key):
+        if not os.path.exists(dst):
+            try:
+                paths, gain = _shifted(d, req.semitones, req.tempo)
+                y, sr_ = stems.mix_parts(paths, gains, gain)
+                stems.render_mp3(y, sr_, dst, ref_rms=m["rms"])   # a mix is never louder than the original
+            except Exception as e:
+                raise HTTPException(500, f"Could not mix the parts: {e}")
+        else:
+            _touch(dst)
+    _prune_media()
+    return {"audio_url": f"/media/{key}.mp3"}
+
+
+class SessionItem(BaseModel):
+    slug: str
+    audio_i: int = Field(0, ge=0)
+    title: str = Field("", max_length=200)
+    semitones: float = Field(0, ge=-12.5, le=12.5)
+    tempo: float = Field(1.0, ge=0.7, le=1.3)
+    gains: dict[str, float | None] = Field(default_factory=dict)
+
+
+class SessionReq(BaseModel):
+    name: str = Field("Bhajan session", max_length=120)
+    gap: float = Field(4.0, ge=0, le=30)
+    items: list[SessionItem] = Field(min_length=1, max_length=40)
+
+
+_sessions: dict[str, dict] = {}     # export jobs by key; the oldest finished ones are dropped
+_sessions_guard = threading.Lock()
+_export_lock = threading.Lock()     # one export at a time: each holds a bhajan's audio in memory
+_exporting: dict[str, int] = {}     # recording folders that queued/running exports still need: never pruned
+
+
+class _Cancelled(Exception):
+    pass
+
+
+def _session_view(key: str, job: dict) -> dict:
+    j = dict(job)                   # a C-level copy: the export thread may be updating the job
+    j.pop("path", None)
+    j.pop("cancel", None)
+    return j | {"id": key}
+
+
+@app.post("/api/session/export")
+def session_export(req: SessionReq):
+    """Start rendering a whole session (every bhajan mixed, in its key, loudness-matched) to one MP3."""
+    items = []
+    for it in req.items:
+        d, _, _ = _parts_dir(it.slug, it.audio_i)
+        if not stems.read_manifest(d):
+            raise HTTPException(409, f"'{it.title or it.slug}' has not been split into parts yet.")
+        items.append({"dir": d, "title": it.title or it.slug, "semitones": round(it.semitones, 3),
+                      "tempo": round(it.tempo, 3), "gains": _clean_gains(it.gains)})
+    key = _h("session", [(i["dir"], i["semitones"], i["tempo"], i["gains"], i["title"]) for i in items],
+             req.gap, stems.SHIFT_VERSION)
+    dst = os.path.join(MEDIA, key + ".mp3")
+    with _sessions_guard:
+        job = _sessions.get(key)
+        if job and (job["state"] in ("queued", "running") or (job["state"] == "done" and os.path.exists(dst))):
+            job["cancel"] = False       # someone wants it again (an earlier page may have given up on it)
+            _touch(dst)
+            return _session_view(key, job)
+        job = _sessions[key] = {"state": "queued", "done": 0, "total": len(items), "msg": "Waiting for another export",
+                                "path": dst, "cancel": False}
+        done = [k for k, j in _sessions.items() if j["state"] not in ("queued", "running")]
+        for k in done[:-20]:
+            del _sessions[k]
+        names = {os.path.basename(i["dir"]) for i in items}
+        for n in names:
+            _exporting[n] = _exporting.get(n, 0) + 1
+            stems.touch(os.path.join(STEMS, n))
+
+    def run():
+        try:
+            with _export_lock:
+                if job["cancel"]:
+                    job.update(state="cancelled")
+                    return
+                job.update(state="running", msg="Starting")
+
+                def progress(i, title):
+                    if job["cancel"]:
+                        raise _Cancelled()
+                    job.update(done=i, msg=title)
+                try:
+                    info = stems.export_session(items, dst, gap_seconds=req.gap, progress=progress)
+                    job.update(state="done", done=len(items), msg="Done", audio_url=f"/media/{key}.mp3", **info)
+                except _Cancelled:
+                    job.update(state="cancelled")
+                except Exception as e:
+                    job.update(state="error", error=str(e))
+        finally:
+            with _sessions_guard:
+                for n in names:
+                    _exporting[n] -= 1
+                    if not _exporting[n]:
+                        del _exporting[n]
+        _prune_media()
+        _prune_stems()
+    threading.Thread(target=run, daemon=True, name="session-export").start()
+    return _session_view(key, job)
+
+
+@app.delete("/api/session/export/{job_id}")
+def session_cancel(job_id: str):
+    """Stop an export the page no longer wants (the session changed): it ends before its next bhajan."""
+    job = _sessions.get(job_id)
+    if not job:
+        raise HTTPException(404, "No such export.")
+    if job["state"] in ("queued", "running"):
+        job["cancel"] = True
+    return _session_view(job_id, job)
+
+
+@app.get("/api/session/export/{job_id}")
+def session_status(job_id: str):
+    job = _sessions.get(job_id)
+    if not job:
+        raise HTTPException(404, "No such export.")
+    if job["state"] == "done":
+        if not os.path.exists(job["path"]):     # pruned from data/media since: export again
+            return {"state": "expired", "id": job_id, "error": "This export was cleared from the cache; export it again."}
+        _touch(job["path"])
+    return _session_view(job_id, job)
+
+
+_prune_stems_lock = threading.Lock()
+
+
+def _prune_stems(cap: int = STEMS_CAP) -> None:
+    """Keep data/stems under `cap` bytes. Shifted copies (cheap to redo) go first, least recently
+    used key first; only then whole recordings' splits (a GPU split to redo), least recently used
+    first. Use is recorded in mtimes (APFS does not update atimes); a split in progress, or anything
+    used in the last 10 minutes, is kept."""
+    if not _prune_stems_lock.acquire(blocking=False):
+        return
+    try:
+        def size(p: str) -> int:
+            n = 0
+            for root, _, files in os.walk(p):
+                for f in files:
+                    try:
+                        n += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            return n
+
+        now = time.time()
+        with _sessions_guard:
+            busy = splits.busy() | set(_exporting)
+        shifts, songs, total = [], [], 0
+        for name in os.listdir(STEMS):
+            d = os.path.join(STEMS, name)
+            if not os.path.isdir(d):
+                continue
+            sd = os.path.join(d, "shift")
+            for k in (os.listdir(sd) if os.path.isdir(sd) else []):
+                p = os.path.join(sd, k)
+                sz = size(p)
+                shifts.append((os.path.getmtime(p), sz, p, name))
+                total += sz
+            whole = size(d)
+            own = whole - sum(s[1] for s in shifts if s[3] == name)
+            total += own
+            try:
+                used = os.path.getmtime(os.path.join(d, "manifest.json"))
+            except OSError:
+                used = os.path.getmtime(d)
+            songs.append((used, own, d, name))
+        for used, sz, p, name in sorted(shifts):
+            if total <= cap:
+                return
+            if name in busy or now - used < 600:
+                continue
+            lk = store.lock(p)               # the lock shifted_parts holds while it renders or reuses this key
+            if not lk.acquire(blocking=False):
+                continue
+            try:
+                if now - os.path.getmtime(p) < 600:      # used since we looked
+                    continue
+                shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                continue
+            finally:
+                lk.release()
+            total -= sz
+        for used, sz, d, name in sorted(songs):
+            if total <= cap:
+                return
+            with _sessions_guard:
+                busy = splits.busy() | set(_exporting)
+            try:
+                used = os.path.getmtime(os.path.join(d, "manifest.json"))
+            except OSError:
+                pass
+            if name in busy or now - used < 600:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            splits.forget(name)
+            total -= sz
+    except OSError:
+        pass
+    finally:
+        _prune_stems_lock.release()
+
+
 # Only this computer's own browser may use the app: the Host check stops DNS-rebinding pages, and
 # the Origin / Sec-Fetch-Site checks stop other websites from driving the API through the browser.
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
@@ -357,19 +686,20 @@ async def _guard_and_revalidate(request, call_next):
     if not _allow_any_host and _host_name(host) not in _LOCAL_HOSTS:
         return JSONResponse({"detail": "Bhajan Studio only answers requests addressed to 127.0.0.1 or localhost."},
                             status_code=403)
-    if request.url.path.startswith("/api/"):
+    if request.url.path.startswith(("/api/", "/stems/")):   # /stems: other sites may not probe which bhajans were split
         site = request.headers.get("sec-fetch-site")
         origin = request.headers.get("origin")
         if (site and site not in ("same-origin", "none")) or \
                 (origin is not None and urllib.parse.urlsplit(origin).netloc.lower() != host.lower()):
             return JSONResponse({"detail": "Requests from other websites are not allowed."}, status_code=403)
     resp = await call_next(request)
-    if not request.url.path.startswith("/media/"):
+    if not request.url.path.startswith(("/media/", "/stems/")):   # both are content-addressed
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
 app.mount("/media", StaticFiles(directory=MEDIA), name="media")
+app.mount("/stems", StaticFiles(directory=STEMS), name="stems")
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "static"), html=True), name="static")
 
 

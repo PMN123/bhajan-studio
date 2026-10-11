@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bhajan Studio</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="stems.css">
   <script src="vendor/abcjs-basic-min.js"></script>
 </head>
 <body>
@@ -59,6 +60,14 @@
           <div id="recbody"></div>
         </section>
 
+        <section class="card" id="partscard" hidden>
+          <div class="card-head">
+            <h3>Parts: singing, tabla, harmonium</h3>
+            <p class="hint">The recording split into its singers and instruments, so you can mute or rebalance them, for example music only for your centre to sing over.</p>
+          </div>
+          <div id="partsbody"></div>
+        </section>
+
         <section class="card" id="sheetcard">
           <div class="card-head">
             <h3>Sheet music, transposed &amp; played</h3>
@@ -67,10 +76,19 @@
           <div id="sheetbody"></div>
         </section>
       </article>
+
+      <section class="card" id="sessioncard" hidden>
+        <div class="card-head">
+          <h3>Your bhajan session</h3>
+          <p class="hint">The bhajans you add from their Parts card, one after another in a single MP3, each in its own key and mix and at the same loudness.</p>
+        </div>
+        <div id="sessionbody"></div>
+      </section>
     </main>
   </div>
 
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
+  <script src="stems.js"></script>
 </body>
 </html>

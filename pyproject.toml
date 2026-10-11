@@ -17,5 +17,14 @@ dependencies = [
     "pyobjc-framework-quartz>=12.2.2 ; sys_platform == 'darwin'",
 ]
 
+[project.optional-dependencies]
+# Splitting a recording into parts (lead, group, tabla, harmonium). Installed the first time a
+# recording is split: PyTorch plus the separation runner, about 1 GB. audioread is imported by
+# audio-separator without being declared.
+stems = [
+    "audio-separator[cpu]==0.47.0",   # [cpu] = onnxruntime, which it imports unconditionally; PyTorch still uses the GPU (MPS)
+    "audioread>=3.0",
+]
+
 [tool.uv]
 package = false

@@ -1,0 +1,48 @@
+/* Parts card and session card (stems.js). Uses the tokens and .btn / .seg / .field / .hint from style.css. */
+#partscard [hidden], #sessioncard [hidden] { display: none !important; }
+/* busy buttons stay focusable (aria-disabled, not disabled), so they look like .btn:disabled */
+#partscard .btn[aria-disabled="true"], #sessioncard .btn[aria-disabled="true"] { opacity: .5; cursor: progress; }
+
+/* split progress */
+.pstep { margin: 0 0 8px; }
+.pbar { position: relative; height: 8px; max-width: 560px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.pbar > span { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); border-radius: inherit; transition: width .3s; }
+.pbar.busy > span { width: 30%; animation: pbar-slide 1.4s ease-in-out infinite; }
+@keyframes pbar-slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+@media (prefers-reduced-motion: reduce) { .pbar > span { transition: none; } .pbar.busy > span { animation-duration: 4s; } }
+
+/* mixer */
+.pseg { display: flex; flex-wrap: wrap; }
+.prows { display: grid; gap: 6px; margin-top: 6px; }
+.prow { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(100px, 220px) 4.2em; gap: 6px 12px; align-items: center;
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+.pname { min-width: 0; font-weight: 600; font-size: 14px; }
+.pname small { margin-left: 4px; color: var(--muted); font-weight: 400; font-size: 12px; opacity: .85; white-space: nowrap; }
+.pmute { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 8px; padding: 3px 10px; font-size: 13px; cursor: pointer; }
+.pmute:hover { border-color: var(--accent); }
+.pmute[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--ink); font-weight: 600; }
+.prow input[type=range], #pseek { width: 100%; min-width: 0; accent-color: var(--accent); }
+.prow .v { color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
+.prow.muted .pname, .prow.muted input[type=range], .prow.muted .v { opacity: .45; }
+.ptransport { flex-wrap: nowrap; gap: 12px; }
+.ptime { color: var(--muted); font-size: 13.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#pseek { flex: 1; }
+
+/* session */
+.sess-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.sess-list li { display: flex; gap: 6px; align-items: center; padding: 6px 8px 6px 12px; border-top: 1px solid var(--line); }
+.sess-list li:first-child { border-top: 0; }
+.sess-list .t { flex: 1; min-width: 0; font-size: 14px; overflow-wrap: anywhere; }
+.ibtn { flex: none; width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); background: var(--bg); color: var(--muted); border-radius: 8px; cursor: pointer; line-height: 1; }
+.ibtn:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
+.ibtn:disabled { opacity: .35; cursor: default; }
+#sessioncard .field input[type=text] { width: 16em; min-width: 0; max-width: 100%; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; }
+#sessout .player { margin-top: 4px; }
+.sess-tracks { margin: 10px 0 0; padding-left: 1.6em; font-size: 14px; }
+.sess-tracks li { margin: 2px 0; }
+.tstart { border: 0; background: none; padding: 0 4px 0 0; color: var(--accent); cursor: pointer; font-variant-numeric: tabular-nums; text-decoration: underline; text-underline-offset: 2px; }
+
+@media (max-width: 560px) {
+  .prow { grid-template-columns: auto minmax(0, 1fr) 4.2em; }
+  .pname { grid-column: 1 / -1; }
+}

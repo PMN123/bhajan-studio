@@ -83,10 +83,48 @@ nothing is fetched twice, and the app never sends more than two requests to the 
 - **Cache:** everything the app downloads or works out goes in `data/` inside the folder. That
   includes the song index, song pages, recordings, sheet PDFs, read scores, instrument samples, and
   rendered and shifted audio. Rendered and shifted audio is kept to about 500 MB (the least recently
-  used goes first). The index is refreshed weekly and song pages monthly. It's safe to delete
-  `data/` at any time; things are fetched again as needed.
+  used goes first). Split parts (`data/stems`) are kept to about 3 GB the same way, and the
+  separation models (`data/models`, about 1.6 GB) stay until you delete them. The index is
+  refreshed weekly and song pages monthly. It's safe to delete `data/` at any time; things are
+  fetched again as needed.
 - **Uninstall:** delete the folder. To remove uv as well, follow
   [uv's uninstall steps](https://docs.astral.sh/uv/getting-started/installation/#uninstallation).
+
+### Parts (singing, tabla, harmonium)
+
+After **Use the recording**, **Split into parts** separates it into the singing (the lead and the
+group that answers, together), tabla (with manjira and other percussion), harmonium (with the other
+melody instruments) and a small remainder. You can then mute or rebalance the parts in your key, at
+85–115% speed, hear the mix straight away, and download it as an MP3. With every part at 0 dB you
+hear the original recording. The presets follow what a centre is missing:
+
+- **Music only:** no instrumentalists. Tabla and harmonium (in the gents' key, say) for the hall to
+  sing over.
+- **Singing only:** no singers, or to learn the tune; the centre's own musicians play along.
+- **Without tabla:** the centre has a tablist but no harmonium player.
+- **Without harmonium:** the centre has a harmonium player but no tablist.
+
+**Weekly session:** **Add to session** collects bhajans, each with its own key, speed and mix.
+**Export session** renders them into one MP3, with a few seconds of silence between bhajans, and
+lists where each one starts. Every bhajan is set to the same loudness as a full recording, and a
+mix without the singers stays as much quieter as the music sits under them, so the hall's voices
+still carry over it.
+
+Recordings Sai Rhythms tags *golden voice* (Swami's own voice) are not split. For bhajans it tags
+*karaoke* or *instrumental*, the card points to that official recording first: where it exists, it
+beats any split.
+
+**The first split** installs PyTorch and the separation runner (about 1 GB, into `.venv`) and
+downloads two separation models (about 1.6 GB, into `data/models`), so allow time for that on a
+slow connection. After that, a split takes about 1–3 minutes per bhajan on Apple Silicon, one
+recording at a time. Each split is kept, and so is each key you shift the parts to.
+
+**What to expect:** the parts are an AI separation of one finished recording, not separate
+microphones, so they are not studio-clean. The harmonium mostly doubles the sung melody, so a
+little harmonium stays in the singing and a little singing in the harmonium. Most Sai Rhythms
+recordings are 22 kHz mono MP3s at about 95 kbps, which also limits how clean the parts can be. The
+singing is the cleanest part; the tabla and harmonium split is the weakest, because no public model
+knows those instruments (pop-trained models hear a ringing dayan stroke as a guitar).
 
 ## How it works
 
@@ -97,6 +135,7 @@ nothing is fetched twice, and the app never sends more than two requests to the 
 | Sheet reader (OMR) | `bhajan/omr.py`, `bhajan/sheet.py` | Built for the Sai Samarpan engraving. Pitch comes from staff position plus accidentals. Rhythm comes from stems, beams, flags, dots, ties and rests. The printed sargam labels are OCR'd with macOS Vision (called through pyobjc) and used to confirm or correct each note. Lyrics are attached from the blue text. A read in which OCR failed is not cached, so it is redone once OCR works. |
 | Key detection | `bhajan/audio.py` | Audio is decoded with the ffmpeg build bundled in imageio-ffmpeg. A YIN pitch tracker builds the recording's pitch-class profile, which is matched at all 12 rotations against the sheet's melody (when available) and the raga's scale. |
 | Pitch shift | `bhajan/audio.py` | The Rubber Band library through pylibrb, using its R3 ("finer") engine offline with formants preserved. The result is never louder than the original on average (RMS), and a gentle look-ahead limiter keeps peaks under −1 dBFS before MP3 encoding with the bundled ffmpeg. The limiter only acts on loudly mastered recordings (shifting brings back peaks their mastering had limited away), where it costs 1–2 dB of loudness. Shifts by the nearest interval by default, and can also correct the recording's tuning to A440. |
+| Parts | `bhajan/stems.py` | Two open separation models run one after the other through [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) on PyTorch (using the GPU on Apple Silicon): Mel-Band RoFormer splits singing from music, and BS-RoFormer SW's drums, cleaned by harmonic/percussive separation (held notes and drones go back to the harmonium), become the tabla. They run in a separate process, so the server never loads PyTorch and a split can be cancelled. Each stage keeps the exact remainder, so the parts add back up to the recording; they are stored at −6 dB as 24-bit FLAC so none can clip. All the parts are shifted together, as channels of one Rubber Band R3 stretcher with formants kept, so the bleed they share stays in phase and they still add up; the browser mixes the shifted parts live, and downloads get the same peak protection as the whole-recording shift. Session exports put each bhajan's full recording at −18 LUFS (ITU-R BS.1770 meter) and apply that gain to the chosen mix. |
 | Synth | `bhajan/synth.py`, `bhajan/instruments.py` | Synthesized flute (the default), recorded piano and harmonium samples (downloaded on first use, retuned, level-matched and looped), tanpura (Sa-Pa or Sa-Ma), and an optional click that follows the sheet's bars. Also writes MIDI with the matching General MIDI instrument. |
 | UI | `static/` | Vanilla JS, with [abcjs](https://www.abcjs.net/) vendored for staff notation |
 
@@ -138,6 +177,12 @@ bindings that the OCR needs.
 - `uv run python tools/test_synth.py` checks all three instruments: timing, levels, clicks, key,
   and WAV/MIDI output. If the samples can't be downloaded, the sampled-instrument checks are
   skipped with a message.
+- `uv run python tools/test_stems.py` checks the parts without the separation models: a synthetic
+  split is read, mixed, shifted, cached and exported as a session, the split queue runs a stand-in
+  for the model process, and the loudness meter is checked against the BS.1770 and EBU Tech 3341
+  reference values. The API checks use FastAPI's test client, which needs `httpx`; the app doesn't
+  install it, so they are skipped with a message unless you run
+  `uv run --extra stems --with httpx python tools/test_stems.py`.
 
 ## Acknowledgements & licenses
 
@@ -154,9 +199,23 @@ bindings that the OCR needs.
 - **[PyMuPDF](https://pymupdf.readthedocs.io/)** (AGPL v3) renders the sheet PDFs, and
   **[PyObjC](https://pyobjc.readthedocs.io/)** (MIT) connects to Apple's Vision framework for OCR.
   The rest of the Python stack (FastAPI, Uvicorn, NumPy, SciPy, Pillow) is under permissive licenses.
+- **[audio-separator](https://github.com/nomadkaraoke/python-audio-separator)** (MIT) by Nomad
+  Karaoke runs the separation models on **[PyTorch](https://pytorch.org/)** (BSD-style). Both are
+  installed from PyPI the first time you split a recording and are not included in this repository.
+- **Separation models.** audio-separator downloads them on first use, from its own and Ultimate
+  Vocal Remover's (UVR) model releases on GitHub, into `data/models/`. They are not included in
+  this repository.
+  - Singing vs. music: the Mel-Band RoFormer vocal model by Kimberley Jensen, licensed under
+    MIT ([source](https://huggingface.co/KimberleyJSN/melbandroformer)).
+  - Tabla vs. harmonium: the BS-RoFormer SW model, as published by jarredou. No license is stated
+    (its Hugging Face model card says `license: unknown`).
 - **Sharing the app.** Share this repository (or its ZIP) and let uv download the packages, as the
   launcher does. A ready-made copy that includes `.venv` or the bundled binaries (a zipped folder,
   an `.app`) contains GPL and AGPL software and may only be passed on under those licenses' terms.
+  Once a recording has been split, `.venv` also holds
+  [diffq](https://github.com/facebookresearch/diffq), a dependency of audio-separator that is
+  licensed for non-commercial use only (CC BY-NC 4.0): another reason to share the repository
+  rather than a copy with `.venv`.
 - **Instrument samples.** The piano and harmonium samples come from the pre-rendered General MIDI
   soundfonts of the [MIDI.js Soundfonts](https://github.com/gleitz/midi-js-soundfonts) project by
   Benjamin Gleitzman. They are downloaded on first use (checksum-verified) into
@@ -176,4 +235,7 @@ bindings that the OCR needs.
   only. Bhajan Studio downloads each item from Sai Rhythms when you ask for it and keeps it only
   in your local cache. The repository includes only a small song list
   (`bhajan/song_index.json.gz`: titles, ragas, beats and first lines) so search works without a
-  download; it does not redistribute the recordings, sheet music, lyrics or meanings.
+  download; it does not redistribute the recordings, sheet music, lyrics or meanings. Parts split
+  from a recording, and the mixes and sessions made from them, are derived from that recording and
+  stay in your local cache; sharing them beyond your own use needs the owners' permission (Sai
+  Rhythms is run by the Sri Sathya Sai International Organization, SSSIO).
