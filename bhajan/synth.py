@@ -264,7 +264,9 @@ def cache_tag(instrument: str) -> str:
     parts = [str(instrument), str(os.path.getmtime(__file__))]
     if instrument != "flute":
         inst = instrument if instrument in instruments.SOURCES else "harmonium"
-        parts += [str(os.path.getmtime(instruments.__file__)), "sampled" if instruments.is_cached(inst) else "synth"]
+        # (the version also keeps a server still running older code from caching under the new files' times)
+        parts += [str(os.path.getmtime(instruments.__file__)), f"v{instruments.SOUND_VERSION}",
+                  "sampled" if instruments.is_cached(inst) else "synth"]
     return "|".join(parts)
 
 

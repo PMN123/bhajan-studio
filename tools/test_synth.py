@@ -1,5 +1,5 @@
 """Synth checks for flute, piano and harmonium: timing, speed, no clipping/NaN/clicks, MIDI/WAV output, seamless
-long notes, the offline fallback, and that the audio is in the requested key.
+long notes, piano repeated notes without a silent gap, the offline fallback, and that the audio is in the requested key.
 
 Piano and harmonium use recorded samples that are downloaded on first use (about 3 MB each). Without internet
 the sample-specific checks are skipped (with a message) and the synthesized fallback is tested instead.
@@ -86,6 +86,41 @@ if sampled:
             return np.sqrt(np.mean(y[int(t * SR): int(t * SR) + w].astype(np.float64) ** 2))
         assert rms(tm[1][0]) < 1.25 * rms(tm[1][0] - 0.05), f"{inst}: a tied note must not be struck again"
     print(f"long-note / tie checks OK for {', '.join(sampled)}")
+
+if "piano" in sampled:
+    # Repeated notes (S S S ...) are struck again while the string still rings, as on a real piano: the level only
+    # dips a little before the new attack. (It used to damp to silence first, a ~40 dB, ~12 ms hole that made the
+    # piano sound choppy.) Legato between different notes stays seamless. Measured on the melody buffer (no reverb).
+    def boundary_dips(y, notes, spq, lead):
+        """(same pitch?, dip dB, ms more than 20 dB down) at each note that starts where the previous one ends."""
+        w = int(0.01 * SR)
+        c = np.concatenate([[0.0], np.cumsum(y.astype(np.float64) ** 2)])
+        def db(t):  # 10 ms RMS level centred at the times t (s)
+            i = (np.atleast_1d(t) * SR).astype(int)
+            return 10 * np.log10((c[i + w // 2] - c[i - w // 2]) / w + 1e-12)
+        out = []
+        for (s0, d0, m0), (s1, d1, m1) in zip(notes, notes[1:]):
+            if abs(s0 + d0 - s1) > 1e-9:
+                continue
+            T, end = lead / SR + s1 * spq, lead / SR + (s1 + d1) * spq
+            e = db(T + np.arange(-40, 41) / 1000)
+            ref = min(db(T - 0.035)[0], db(np.arange(T, min(T + 0.08, end - 0.005), 0.001)).max())
+            out.append((m0 == m1, ref - e[10:71].min(), int((e < ref - 20).sum())))
+        return out
+    rows = []
+    for m in (52, 57, 60, 64, 67, 72, 76):  # every sample zone a melody uses
+        mel = [(0, 1, m), (1, 1, m), (2, .5, m), (2.5, .5, m), (3, .5, m), (3.5, 1.5, m + 2), (5, 1, m + 4),
+               (6, 3, m + 4), (9, 1, m + 2), (10, .25, m + 2), (10.25, .25, m + 2), (10.5, 1.5, m)]
+        for bpm in (70, 120):
+            spq = 60 / bpm
+            y = instruments.render_notes("piano", mel, spq, SR + int((12 * spq + 1) * SR), SR, SR)
+            rows += boundary_dips(y, mel, spq, SR)
+    same = [r for r in rows if r[0]]
+    assert max(r[1] for r in same) < 15 and max(r[2] for r in same) == 0, ("piano re-strike hole", max(same, key=lambda r: r[1]))
+    assert min(r[1] for r in same) > 3, ("a repeated piano note must still be heard as a new note", min(same, key=lambda r: r[1]))
+    assert max(r[1] for r in rows if not r[0]) < 8, "piano legato between different notes must stay smooth"
+    print(f"piano repeated-note checks OK (re-strike dip {np.median([r[1] for r in same]):.1f} dB median, "
+          f"max {max(r[1] for r in same):.1f} dB; no silent gap)")
 
 with tempfile.TemporaryDirectory() as td:
     y, _ = synth.render(ev, 62, 100, instrument="flute")
